@@ -26,6 +26,7 @@ def get_adapter(settings: Settings) -> AgentAdapter:
             python_executable=settings.worker_python,
             synthetic=False,
             real_transport=settings.worker_real_transport,
+            worker_principal_sid=settings.worker_principal_sid,
         )
     raise NoRealAdapterAvailable(
         "real AI disabled (default fail-closed); Mock is test-only"

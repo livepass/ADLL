@@ -39,6 +39,9 @@ class Settings:
     worker_deny_write: tuple[str, ...] = ()
     worker_python: str | None = None
     worker_real_transport: bool = False
+    # S9 网络边界的 Worker 安全主体（专用本地账户 SID）。真实发送的强制门禁：
+    # 未配置或无法解析即 fail-closed，绝不降级为父进程账户。
+    worker_principal_sid: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -82,6 +85,7 @@ class Settings:
             ),
             worker_python=os.getenv("ADLL_WORKER_PYTHON") or None,
             worker_real_transport=_env_bool("ADLL_WORKER_REAL_TRANSPORT", False),
+            worker_principal_sid=os.getenv("ADLL_WORKER_PRINCIPAL_SID") or None,
         )
 
 

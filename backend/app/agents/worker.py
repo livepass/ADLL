@@ -43,6 +43,7 @@ class WorkerAgentAdapter(AgentAdapter):
         python_executable: str | None = None,
         synthetic: bool = False,
         real_transport: bool = False,
+        worker_principal_sid: str | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.model = model
@@ -54,6 +55,7 @@ class WorkerAgentAdapter(AgentAdapter):
         self.python_executable = python_executable
         self.synthetic = synthetic
         self.real_transport = real_transport
+        self.worker_principal_sid = worker_principal_sid
         # 最近一次 worker job/result（不含凭据；供审计/测试检查序列化面）。
         self.last_job: dict | None = None
         self.last_result: dict | None = None
@@ -120,6 +122,20 @@ class WorkerAgentAdapter(AgentAdapter):
             key = os.environ.get("DASHSCOPE_API_KEY")
             if not key:
                 raise AdapterDisabled("DASHSCOPE_API_KEY missing (never logged)")
+            # S9 强制门禁：真实传输必须满足可信采集的 OS 网络边界证据。
+            # 仅 real_transport + API Key 存在不能绕过；未配置/采集异常/覆盖不足
+            # 一律 fail-closed，零外发。合成模式不冒充真实 OS 网络证据。
+            from ..services import network_boundary
+
+            evidence = network_boundary.collect_boundary_evidence(
+                self.worker_principal_sid
+            )
+            boundary = network_boundary.evaluate(evidence)
+            if not boundary.passed:
+                raise AdapterDisabled(
+                    f"s9_network_boundary_{boundary.status}:"
+                    + ",".join(boundary.reasons)
+                )
             env_extra["ADLL_WORKER_REAL_TRANSPORT"] = "1"
             env_extra["DASHSCOPE_API_KEY"] = key
         if sink is not None:
