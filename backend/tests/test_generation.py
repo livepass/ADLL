@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 from sqlalchemy import text
@@ -14,6 +15,8 @@ from app.services import generation_service
 from app.services.generation_service import GenerationBlocked, GenerationFailed
 from app.services.outbound_pipeline import OutboundDenied
 from tests.helpers import (
+    RECEIVER_MOCK,
+    RECEIVER_WORKER,
     csrf_headers,
     git,
     login_client,
@@ -22,7 +25,7 @@ from tests.helpers import (
 )
 
 
-def _setup(tmp_path, app_factory, *, testing=True, binary=False):
+def _setup(tmp_path, app_factory, *, testing=True, binary=False, receiver=RECEIVER_WORKER):
     repo = make_repo(tmp_path)
     (repo / "secret.txt").write_text("secret\n", encoding="utf-8", newline="\n")
     (repo / "other.txt").write_text("other\n", encoding="utf-8", newline="\n")
@@ -52,7 +55,7 @@ def _setup(tmp_path, app_factory, *, testing=True, binary=False):
         json={"content": "需求"},
         headers=csrf_headers(csrf, "k-req"),
     )
-    auth_id = seed_authorization(app, task["id"], scope={"paths": ["a.txt"]})
+    auth_id = seed_authorization(app, task["id"], scope={"paths": ["a.txt"]}, receiver=receiver)
     return app, client, csrf, repo, task, auth_id
 
 
@@ -88,19 +91,36 @@ def _source(repo, path="a.txt"):
     return [{"path": path, "content": content, "sha256": hashlib.sha256(content.encode()).hexdigest()}]
 
 
-def _start(db, task, auth, repo, adapter, *, testing):
+def _snapshot_digest(items):
+    canonical = json.dumps(items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _start(db, task, auth, repo, adapter, *, testing, preview_digest=None):
+    from app.services.outbound_pipeline import prepare as prepare_outbound
+
+    items = _source(repo)
+    prepared = prepare_outbound(
+        task=task,
+        auth=auth,
+        receiver=auth.receiver,
+        requirement_text="需求",
+        feedback_texts=[],
+        source_items=items,
+        model="m",
+    )
     return generation_service.start(
         db,
         task,
         auth,
-        receiver=auth.receiver,
-        data_types=list(auth.data_types),
-        scope=dict(auth.send_scope),
         requirement_text="需求",
         feedback_texts=[],
-        source_items=_source(repo),
+        source_items=items,
         model="m",
         adapter=adapter,
+        snapshot_digest=_snapshot_digest(items),
+        snapshot_manifest=items,
+        preview_digest=preview_digest if preview_digest is not None else prepared.request_digest,
         testing=testing,
     )
 
@@ -117,12 +137,22 @@ def test_success_creates_execution_verification_proposal(tmp_path, app_factory) 
         assert verification.status == "verified"
         assert proposal is not None and proposal.content == "synthetic plan"
         assert len(calls) == 1
-        audit = db.query(SendAuditRecord).filter_by(execution_id=str(execution.id)).one()
-        assert audit.payload_manifest["tool_return"] == []
-        assert audit.payload_manifest["source"][0]["path"] == "a.txt"
-        assert len(audit.content_digest) == 64
-        assert audit.payload_digest is not None and len(audit.payload_digest) == 64
-        assert audit.payload_digest != audit.content_digest
+        audits = (
+            db.query(SendAuditRecord)
+            .filter_by(execution_id=str(execution.id))
+            .order_by(SendAuditRecord.id)
+            .all()
+        )
+        assert [row.phase for row in audits] == ["prepared", "confirmed_sent"]
+        assert audits[0].attempt_id == audits[1].attempt_id
+        prepared_row = audits[0]
+        assert prepared_row.payload_manifest["tool_return"] == []
+        assert prepared_row.payload_manifest["source"][0]["path"] == "a.txt"
+        assert len(prepared_row.content_digest) == 64
+        assert prepared_row.payload_digest is not None and len(prepared_row.payload_digest) == 64
+        assert prepared_row.payload_digest != prepared_row.content_digest
+        assert prepared_row.receiver == "https://example.invalid/v1/messages"
+        assert audits[1].error_code is None
     finally:
         db.close()
 
@@ -215,7 +245,9 @@ def test_unverified_execution_yields_no_proposal(tmp_path, app_factory) -> None:
 def test_api_generation_testing_flow(tmp_path, app_factory) -> None:
     import time
 
-    app, client, csrf, repo, task, auth_id = _setup(tmp_path, app_factory, testing=True)
+    app, client, csrf, repo, task, auth_id = _setup(
+        tmp_path, app_factory, testing=True, receiver=RECEIVER_MOCK
+    )
     resp = client.post(
         f"/api/tasks/{task['id']}/generations",
         json={"authorization_id": auth_id},
@@ -255,7 +287,9 @@ def test_api_generation_testing_flow(tmp_path, app_factory) -> None:
 def test_api_generation_baseline_unavailable_returns_423(tmp_path, app_factory) -> None:
     from app.models.repository import AnalysisBaseline
 
-    app, client, csrf, repo, task, auth_id = _setup(tmp_path, app_factory, testing=True)
+    app, client, csrf, repo, task, auth_id = _setup(
+        tmp_path, app_factory, testing=True, receiver=RECEIVER_MOCK
+    )
     db = app.state.db.session()
     try:
         baseline = db.get(AnalysisBaseline, task["baseline_id"])
@@ -335,5 +369,87 @@ def test_terminal_freeze_and_verification_append_only(tmp_path, app_factory) -> 
             db.execute(text("UPDATE verification_attempts SET status='failed'"))
             db.commit()
         db.rollback()
+    finally:
+        db.close()
+
+def test_timeout_records_possibly_sent(tmp_path, app_factory) -> None:
+    app, _client, _csrf, repo, task, auth_id = _setup(tmp_path, app_factory)
+    db, task_obj, auth = _objects(app, task["id"], auth_id)
+
+    def transport(payload, timeout):
+        raise TimeoutError()
+
+    try:
+        with pytest.raises(GenerationFailed):
+            _start(db, task_obj, auth, repo, _adapter(transport), testing=True)
+        rows = (
+            db.query(SendAuditRecord)
+            .filter_by(execution_id=str(db.query(GenerationExecution).one().id))
+            .order_by(SendAuditRecord.id)
+            .all()
+        )
+        assert [row.phase for row in rows] == ["prepared", "possibly_sent"]
+        assert rows[1].error_code == "timeout"
+        assert rows[0].request_digest
+    finally:
+        db.close()
+
+
+def test_disabled_adapter_records_not_sent(tmp_path, app_factory) -> None:
+    app, _client, _csrf, repo, task, auth_id = _setup(tmp_path, app_factory)
+    db, task_obj, auth = _objects(app, task["id"], auth_id)
+    calls = []
+    try:
+        with pytest.raises(GenerationFailed):
+            _start(
+                db,
+                task_obj,
+                auth,
+                repo,
+                _adapter(_ok_transport(calls), enabled=False),
+                testing=True,
+            )
+        execution = db.query(GenerationExecution).one()
+        rows = (
+            db.query(SendAuditRecord)
+            .filter_by(execution_id=str(execution.id))
+            .order_by(SendAuditRecord.id)
+            .all()
+        )
+        assert [row.phase for row in rows] == ["prepared", "not_sent"]
+        assert calls == []
+    finally:
+        db.close()
+
+
+def test_production_requires_preview_digest(tmp_path, app_factory) -> None:
+    app, _client, _csrf, repo, task, auth_id = _setup(tmp_path, app_factory)
+    db, task_obj, auth = _objects(app, task["id"], auth_id)
+    calls = []
+    try:
+        with pytest.raises(GenerationBlocked) as exc:
+            _start(
+                db, task_obj, auth, repo, _adapter(_ok_transport(calls)),
+                testing=False, preview_digest="",
+            )
+        assert exc.value.code == "preview_required"
+        assert calls == []
+        assert db.query(GenerationExecution).count() == 0
+    finally:
+        db.close()
+
+
+def test_production_rejects_stale_preview_digest(tmp_path, app_factory) -> None:
+    app, _client, _csrf, repo, task, auth_id = _setup(tmp_path, app_factory)
+    db, task_obj, auth = _objects(app, task["id"], auth_id)
+    calls = []
+    try:
+        with pytest.raises(GenerationBlocked) as exc:
+            _start(
+                db, task_obj, auth, repo, _adapter(_ok_transport(calls)),
+                testing=False, preview_digest="0" * 64,
+            )
+        assert exc.value.code == "preview_digest_mismatch"
+        assert calls == []
     finally:
         db.close()

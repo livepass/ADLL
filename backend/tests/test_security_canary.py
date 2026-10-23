@@ -18,7 +18,15 @@ from app.agents.worker import WorkerAgentAdapter
 from app.models.outbound import OutboundAuthorization
 from app.models.task import Task
 from app.services import generation_service
-from tests.helpers import csrf_headers, git, login_client, make_repo, seed_authorization
+from app.services.outbound_pipeline import prepare as prepare_outbound
+from tests.helpers import (
+    RECEIVER_WORKER,
+    csrf_headers,
+    git,
+    login_client,
+    make_repo,
+    seed_authorization,
+)
 
 pytestmark = [pytest.mark.skipif(os.name != "nt", reason="Windows-only worker")]
 
@@ -64,7 +72,9 @@ def test_sensitive_canary_absent_from_logs_serialization_and_db(
         json={"content": "仅发送 a.txt"},
         headers=csrf_headers(csrf, "canary-req"),
     )
-    auth_id = seed_authorization(app, task["id"], scope={"paths": ["a.txt"]})
+    auth_id = seed_authorization(
+        app, task["id"], scope={"paths": ["a.txt"]}, receiver=RECEIVER_WORKER
+    )
 
     worker_root = tmp_path / "worker"
     worker_root.mkdir()
@@ -83,25 +93,33 @@ def test_sensitive_canary_absent_from_logs_serialization_and_db(
         task_obj = db.get(Task, task["id"])
         auth = db.get(OutboundAuthorization, auth_id)
         content = (repo / "a.txt").read_text(encoding="utf-8")
+        items = [
+            {
+                "path": "a.txt",
+                "content": content,
+                "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            }
+        ]
+        preview = prepare_outbound(
+            task=task_obj,
+            auth=auth,
+            receiver=adapter.endpoint,
+            requirement_text="仅发送 a.txt",
+            feedback_texts=[],
+            source_items=items,
+            model="m",
+        )
         with caplog.at_level(logging.DEBUG):
             execution, _verification, _proposal = generation_service.start(
                 db,
                 task_obj,
                 auth,
-                receiver=auth.receiver,
-                data_types=list(auth.data_types),
-                scope=dict(auth.send_scope),
                 requirement_text="仅发送 a.txt",
                 feedback_texts=[],
-                source_items=[
-                    {
-                        "path": "a.txt",
-                        "content": content,
-                        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                    }
-                ],
+                source_items=items,
                 model="m",
                 adapter=adapter,
+                preview_digest=preview.request_digest,
                 testing=False,
             )
         assert execution.status == "completed"

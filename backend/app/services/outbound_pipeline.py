@@ -1,6 +1,8 @@
 """发送前强制检查与载荷组装（T028/T029）。
 
-- 五项同时成立：同任务、同基准、同接收方、同实际发送范围、授权 active。
+- 五项同时成立：同任务、同基准、同接收方（实际端点）、同实际发送范围、授权 active。
+- 实际数据类型**从最终请求计算**（需求/反馈/源码/工具返回），不读取授权记录自证。
+- `send_scope` 是显式路径白名单；空 scope 不再表示全部源码。
 - 仅使用已授权内容组装请求；工具返回恒空（候选 C）。
 - 记录请求摘要、接收方、发送范围；任何超出授权 → 拒绝且零发送。
 """
@@ -12,6 +14,8 @@ from dataclasses import dataclass
 from . import outbound
 from .snapshot import _is_sensitive
 from ..core.payload import payload_digest as compute_payload_digest
+
+TOOL_RETURNS: tuple = ()
 
 
 class OutboundDenied(Exception):
@@ -27,6 +31,26 @@ class Prepared:
     request_digest: str
     receiver: str
     scope: dict
+    data_types: list[str]
+
+
+def actual_data_types(
+    requirement_text: str,
+    feedback_texts: list[str],
+    source_items: list[dict],
+    tool_returns: tuple | list = TOOL_RETURNS,
+) -> list[str]:
+    """Compute what is really being sent, independent of the authorization record."""
+    types: list[str] = []
+    if requirement_text and requirement_text.strip():
+        types.append("requirement")
+    if [text for text in feedback_texts if text and text.strip()]:
+        types.append("feedback")
+    if source_items:
+        types.append("source")
+    if tool_returns:
+        types.append("tool_return")
+    return types
 
 
 def _compose(requirement_text: str, feedback_texts: list[str], source_items: list[dict]) -> str:
@@ -47,20 +71,21 @@ def prepare(
     task,
     auth,
     receiver: str,
-    data_types: list[str],
-    scope: dict,
     requirement_text: str,
     feedback_texts: list[str],
     source_items: list[dict],
     model: str,
     max_tokens: int = 256,
 ) -> Prepared:
+    actual_types = actual_data_types(requirement_text, feedback_texts, source_items)
+    scope = {"paths": sorted({item["path"] for item in source_items})}
+
     decision = outbound.evaluate(
         auth,
         task_id=task.id,
         baseline_id=task.baseline_id,
         receiver=receiver,
-        data_types=data_types,
+        data_types=actual_types,
         scope=scope,
     )
     if not decision.allowed:
@@ -82,13 +107,13 @@ def prepare(
         "messages": [{"role": "user", "content": text}],
     }
     manifest = {
-        "requirement": [requirement_text],
-        "feedback": list(feedback_texts),
+        "requirement": [requirement_text] if "requirement" in actual_types else [],
+        "feedback": list(feedback_texts) if "feedback" in actual_types else [],
         "source": [{"path": i["path"], "sha256": i["sha256"]} for i in source_items],
         "tool_return": [],
     }
     digest = compute_payload_digest(payload)
-    prepared = Prepared(payload, manifest, digest, receiver, scope)
+    prepared = Prepared(payload, manifest, digest, receiver, scope, actual_types)
     _assert_alignment(prepared, requirement_text, feedback_texts, source_items)
     return prepared
 
@@ -105,6 +130,10 @@ def _assert_alignment(
         raise OutboundDenied("manifest_misalignment")
     if prepared.payload_manifest["tool_return"] != []:
         raise OutboundDenied("tool_return_not_empty")
+    if prepared.payload_manifest["source"] != [
+        {"path": item["path"], "sha256": item["sha256"]} for item in source_items
+    ]:
+        raise OutboundDenied("manifest_source_mismatch")
     if set(prepared.payload.keys()) != {
         "model",
         "max_tokens",

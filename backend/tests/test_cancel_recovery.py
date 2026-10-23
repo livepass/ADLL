@@ -17,6 +17,7 @@ from app.models.proposal import ProposalVersion
 from app.models.task import Task
 from app.services import generation_service, outbound_pipeline
 from tests.helpers import (
+    RECEIVER_WORKER,
     csrf_headers,
     git,
     login_client,
@@ -46,7 +47,9 @@ def _setup(tmp_path, app_factory):
         json={"content": "需求"},
         headers=csrf_headers(csrf, "k-req"),
     ).json()["requirement_version"]
-    auth_id = seed_authorization(app, task["id"], scope={"paths": ["a.txt"]})
+    auth_id = seed_authorization(
+        app, task["id"], scope={"paths": ["a.txt"]}, receiver=RECEIVER_WORKER
+    )
     db = app.state.db.session()
     try:
         task_obj = db.get(Task, task["id"])
@@ -76,8 +79,6 @@ def _prepared(db, task, auth, repo):
         task=task,
         auth=auth,
         receiver=auth.receiver,
-        data_types=list(auth.data_types),
-        scope=dict(auth.send_scope),
         requirement_text="需求",
         feedback_texts=[],
         source_items=_source(repo),
@@ -132,6 +133,9 @@ def test_cancel_before_send_is_cancelled_without_send(tmp_path, app_factory) -> 
             requirement_id=requirement["id"],
             task_id=task.id,
             baseline_id=task.baseline_id,
+            snapshot_digest="0" * 64,
+            snapshot_manifest=_source(repo),
+            isolation={"ok": True, "details": {"synthetic": True}},
             testing=True,
             cancel_event=event,
         )
@@ -172,6 +176,9 @@ def test_cancel_after_send_is_not_cancelled_and_late_result_recorded(tmp_path, a
             requirement_id=requirement["id"],
             task_id=task.id,
             baseline_id=task.baseline_id,
+            snapshot_digest="0" * 64,
+            snapshot_manifest=_source(repo),
+            isolation={"ok": True, "details": {"synthetic": True}},
             testing=True,
             cancel_event=event,
         )
@@ -225,9 +232,6 @@ def test_single_running_execution_enforced(tmp_path, app_factory) -> None:
                 app.state.db.session,
                 task,
                 auth,
-                receiver=auth.receiver,
-                data_types=list(auth.data_types),
-                scope=dict(auth.send_scope),
                 requirement_text="需求",
                 feedback_texts=[],
                 source_items=_source(repo),
@@ -245,8 +249,7 @@ def test_retry_has_independent_execution_identity(tmp_path, app_factory) -> None
     try:
         first = generation_service.start_async(
             db, app.state.db.session, task, auth,
-            receiver=auth.receiver, data_types=list(auth.data_types),
-            scope=dict(auth.send_scope), requirement_text="需求", feedback_texts=[],
+            requirement_text="需求", feedback_texts=[],
             source_items=_source(repo), model="m", adapter=_adapter(_ok()), testing=True,
         )
         for _ in range(200):
@@ -259,8 +262,7 @@ def test_retry_has_independent_execution_identity(tmp_path, app_factory) -> None
             time.sleep(0.02)
         second = generation_service.start_async(
             db, app.state.db.session, task, auth,
-            receiver=auth.receiver, data_types=list(auth.data_types),
-            scope=dict(auth.send_scope), requirement_text="需求", feedback_texts=[],
+            requirement_text="需求", feedback_texts=[],
             source_items=_source(repo), model="m", adapter=_adapter(_ok()), testing=True,
         )
         assert first != second
@@ -302,6 +304,9 @@ def test_worker_termination_records_true_cancel_outcome(
             requirement_id=requirement["id"],
             task_id=task.id,
             baseline_id=task.baseline_id,
+            snapshot_digest="0" * 64,
+            snapshot_manifest=_source(repo),
+            isolation={"ok": True, "details": {"synthetic": True}},
             testing=True,
             cancel_event=event,
         )
@@ -327,7 +332,11 @@ def test_late_result_append_only(tmp_path, app_factory) -> None:
             db, execution, _prepared(db, task, auth, repo), _adapter(transport),
             auth_id=auth.id, requirement_text="需求", feedback_texts=[],
             source_items=_source(repo), requirement_id=requirement["id"],
-            task_id=task.id, baseline_id=task.baseline_id, testing=True, cancel_event=event,
+            task_id=task.id, baseline_id=task.baseline_id,
+            snapshot_digest="0" * 64,
+            snapshot_manifest=_source(repo),
+            isolation={"ok": True, "details": {"synthetic": True}},
+            testing=True, cancel_event=event,
         )
         with pytest.raises(Exception):
             db.execute(text("UPDATE late_result_records SET disposition='x'"))

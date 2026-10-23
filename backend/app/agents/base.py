@@ -31,6 +31,8 @@ class GenerationResult:
     cost: dict[str, Any]
     terminal_status: str
     tool_call_log: list[dict[str, Any]] = field(default_factory=list)
+    # 传输事实（不伪造网络状态）：sent/confirmed/transport/response_digest。
+    send_evidence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

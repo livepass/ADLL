@@ -29,6 +29,12 @@ backend/staging-*/
 # --- Windows 保留设备名，git 无法正确读写 ---
 backend/nul
 
+# --- 本机一次性运维脚本（含本机 SID / ProgramData 路径，不公开）---
+repair_project_acl.ps1
+backend/scripts/harden_project_acl.ps1
+backend/scripts/install_account_staging_diag.ps1
+backend/scripts/install_account_staging_repair.ps1
+
 # --- 本地工具状态 ---
 .claude/
 .dsh_inspect/

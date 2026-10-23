@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from app.isolation import win32
-from app.isolation.sandbox import IsolationSpec, Sandbox
+from app.isolation.sandbox import IsolationSpec, Sandbox, default_python
 
 pytestmark = [
     pytest.mark.skipif(os.name != "nt", reason="Windows-only OS isolation evidence"),
@@ -197,14 +197,15 @@ def test_job_object_denies_breakaway(iso_root) -> None:
             "import subprocess, sys, time\n"
             "try:\n"
             "    p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], creationflags=0x01000000)\n"
-            "    open(sys.argv[1], 'w').write('STARTED:' + str(p.pid))\n"
+            "    open(sys.argv[1], 'w', encoding='utf-8', errors='replace').write('STARTED:' + str(p.pid))\n"
             "except Exception as exc:\n"
-            "    open(sys.argv[1], 'w').write('FAILED:' + type(exc).__name__ + ':' + str(exc))\n"
+            "    open(sys.argv[1], 'w', encoding='utf-8', errors='replace').write('FAILED:' + type(exc).__name__ + ':' + str(exc))\n"
             "time.sleep(30)\n",
             encoding="utf-8",
         )
+        sandbox._allow_restricted_read(script)
         process = win32.spawn_restricted(
-            [sys.executable, "-I", str(script), str(result_file)],
+            [default_python(), "-I", str(script), str(result_file)],
             cwd=sandbox.work_dir,
             env=win32.build_environment(),
             restricting_sid=sandbox.restricting_sid,
@@ -271,8 +272,9 @@ def test_job_object_kills_worker_child_tree(iso_root) -> None:
             "time.sleep(30)\n",
             encoding="utf-8",
         )
+        sandbox._allow_restricted_read(script)
         process = win32.spawn_restricted(
-            [sys.executable, "-I", str(script), str(pid_file)],
+            [default_python(), "-I", str(script), str(pid_file)],
             cwd=sandbox.work_dir,
             env=win32.build_environment(),
             restricting_sid=sandbox.restricting_sid,
@@ -347,3 +349,82 @@ def test_injection_text_is_data_not_command_and_repo_scripts_never_run(iso_root)
     assert marker.exists() is False
     assert (repo / "run.bat").exists()
     assert "SYNTHETIC_WORKER_PLAN" in result["response"]["content"][0]["text"]
+
+def test_probe_fails_when_staged_script_tampered(iso_root) -> None:
+    """父进程可写也不能悄悄换掉探针：每次启动前重算 SHA-256。"""
+    spec = IsolationSpec(sandbox_root=iso_root, acl_root=iso_root, process_timeout_seconds=30)
+    with Sandbox(spec) as sandbox:
+        sandbox.probe_script.write_bytes(
+            sandbox.probe_script.read_bytes() + b"\n# tampered\n"
+        )
+        result = sandbox.probe(sandbox.write_subset({"a.txt": b"ok"}))
+    assert result.ok is False
+    assert result.error == "script_tampered"
+
+
+def test_worker_run_fails_when_staged_script_tampered(iso_root) -> None:
+    spec = IsolationSpec(sandbox_root=iso_root, acl_root=iso_root, process_timeout_seconds=30)
+    with Sandbox(spec) as sandbox:
+        sandbox.probe(sandbox.write_subset({"a.txt": b"ok"}))
+        sandbox.worker_script.write_bytes(
+            sandbox.worker_script.read_bytes() + b"\n# tampered\n"
+        )
+        result = sandbox.run(
+            {"mode": "synthetic", "synthetic_allowed": True, "requirement": "x"}
+        )
+    assert result["ok"] is False
+    assert result["error"] == "script_tampered"
+    assert result["sent"] is False
+
+
+def test_probe_fails_when_interpreter_missing(tmp_path) -> None:
+    spec = IsolationSpec(
+        sandbox_root=tmp_path,
+        acl_root=tmp_path,
+        python_executable=str(tmp_path / "missing-python.exe"),
+        process_timeout_seconds=30,
+    )
+    with Sandbox(spec) as sandbox:
+        result = sandbox.probe(sandbox.write_subset({"a.txt": b"ok"}))
+    assert result.ok is False
+    assert result.error is not None and result.error.startswith("probe_spawn:")
+
+
+def test_probe_fails_when_staged_script_tampered(iso_root) -> None:
+    """父进程可写也不能悄悄换掉探针：每次启动前重算 SHA-256。"""
+    spec = IsolationSpec(sandbox_root=iso_root, acl_root=iso_root, process_timeout_seconds=30)
+    with Sandbox(spec) as sandbox:
+        sandbox.probe_script.write_bytes(
+            sandbox.probe_script.read_bytes() + b"\n# tampered\n"
+        )
+        result = sandbox.probe(sandbox.write_subset({"a.txt": b"ok"}))
+    assert result.ok is False
+    assert result.error == "script_tampered"
+
+
+def test_worker_run_fails_when_staged_script_tampered(iso_root) -> None:
+    spec = IsolationSpec(sandbox_root=iso_root, acl_root=iso_root, process_timeout_seconds=30)
+    with Sandbox(spec) as sandbox:
+        sandbox.probe(sandbox.write_subset({"a.txt": b"ok"}))
+        sandbox.worker_script.write_bytes(
+            sandbox.worker_script.read_bytes() + b"\n# tampered\n"
+        )
+        result = sandbox.run(
+            {"mode": "synthetic", "synthetic_allowed": True, "requirement": "x"}
+        )
+    assert result["ok"] is False
+    assert result["error"] == "script_tampered"
+    assert result["sent"] is False
+
+
+def test_probe_fails_when_interpreter_missing(tmp_path) -> None:
+    spec = IsolationSpec(
+        sandbox_root=tmp_path,
+        acl_root=tmp_path,
+        python_executable=str(tmp_path / "missing-python.exe"),
+        process_timeout_seconds=30,
+    )
+    with Sandbox(spec) as sandbox:
+        result = sandbox.probe(sandbox.write_subset({"a.txt": b"ok"}))
+    assert result.ok is False
+    assert result.error is not None and result.error.startswith("probe_spawn:")

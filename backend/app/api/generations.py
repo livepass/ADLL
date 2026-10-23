@@ -13,9 +13,9 @@ from ..models.repository import AnalysisBaseline, GitRepository
 from ..models.session import UserSession
 from ..models.task import Task
 from ..security.deps import get_db, require_user_action, require_user_role
-from ..services import generation_service, snapshot, task_service
+from ..services import generation_service, outbound, snapshot, task_service
 from ..services.generation_service import GenerationBlocked
-from ..services.outbound_pipeline import OutboundDenied
+from ..services.outbound_pipeline import OutboundDenied, prepare as prepare_outbound
 from .common import http_error, idempotent
 from .serializers import proposal_dict
 
@@ -30,6 +30,8 @@ def _git(request: Request) -> GitAdapter:
 class GenerateBody(BaseModel):
     authorization_id: int
     feedback: list[str] = []
+    # 生产模式必须回传预览得到的 request_digest，证明操作者看过待发送内容。
+    preview_digest: str | None = None
 
 
 def _materialize_sources(request: Request, db, task, auth):
@@ -37,7 +39,12 @@ def _materialize_sources(request: Request, db, task, auth):
     baseline = db.get(AnalysisBaseline, task.baseline_id)
     if repo is None or baseline is None:
         raise GenerationBlocked("baseline_unavailable")
-    paths = (auth.send_scope or {}).get("paths")
+    paths = outbound.scope_paths(auth.send_scope)
+    if paths is None:
+        raise GenerationBlocked("scope_unverifiable")
+    if not paths:
+        # 空 scope 不再表示“全部源码”；没有显式白名单就不发送任何源码。
+        raise GenerationBlocked("scope_required")
     git = _git(request)
     materialization = snapshot.materialize(
         git, repo.path, baseline.commit_sha, authorized_paths=paths
@@ -95,14 +102,14 @@ def start_generation(
                 request.app.state.db.session,
                 task,
                 auth,
-                receiver=auth.receiver,
-                data_types=list(auth.data_types or []),
-                scope=dict(auth.send_scope or {}),
                 requirement_text=requirement.content,
                 feedback_texts=body.feedback,
                 source_items=items,
                 model=request.app.state.settings.dashscope_model,
                 adapter=adapter,
+                snapshot_digest=materialization.digest,
+                snapshot_manifest=materialization.files,
+                preview_digest=body.preview_digest,
                 testing=request.app.state.settings.testing,
             )
         except GenerationBlocked as exc:
@@ -117,7 +124,7 @@ def start_generation(
             "status": "running",
             "snapshot": {
                 "digest": materialization.digest,
-                "authorized_paths": list((auth.send_scope or {}).get("paths") or []),
+                "authorized_paths": list(outbound.scope_paths(auth.send_scope) or []),
                 # snapshot_files 为快照原始文件；files 为实际进入请求的文本文件。
                 "snapshot_files": [f["path"] for f in materialization.files],
                 "files": [item["path"] for item in items],
@@ -131,7 +138,12 @@ def start_generation(
     return idempotent(
         request,
         db,
-        {"task_id": task_id, "authorization_id": body.authorization_id, "feedback": body.feedback},
+        {
+            "task_id": task_id,
+            "authorization_id": body.authorization_id,
+            "feedback": body.feedback,
+            "preview_digest": body.preview_digest,
+        },
         handler,
     )
 
@@ -149,6 +161,78 @@ def _execution_dict(execution: GenerationExecution) -> dict:
         "usage": execution.usage,
         "usage_basis": execution.usage_basis,
         "cost": execution.cost,
+    }
+
+
+class PreviewBody(BaseModel):
+    authorization_id: int
+    feedback: list[str] = []
+
+
+@router.post("/tasks/{task_id}/generations/preview")
+def preview_generation(
+    task_id: int,
+    body: PreviewBody,
+    request: Request,
+    db=Depends(get_db),
+    session: UserSession = Depends(require_user_action),
+):
+    """Read-only: show the exact outbound scope and content digests before sending."""
+    task = db.get(Task, task_id)
+    if task is None:
+        http_error(404, "not_found", "任务不存在")
+    auth = db.get(OutboundAuthorization, body.authorization_id)
+    if auth is None:
+        http_error(404, "not_found", "出站授权不存在")
+    try:
+        adapter = request.app.state.adapter_factory()
+    except NoRealAdapterAvailable:
+        http_error(503, "ai_disabled", "真实 AI 发送默认关闭（fail-closed）")
+    requirement = task_service.current_requirement(db, task)
+    if requirement is None:
+        http_error(409, "no_requirement", "尚无正式需求版本")
+    baseline = db.get(AnalysisBaseline, task.baseline_id)
+    if baseline is None or not baseline.available:
+        http_error(423, "baseline_unavailable", "分析基准不可用（fail-closed）")
+    try:
+        materialization, items, binary_skipped = _materialize_sources(request, db, task, auth)
+        prepared = prepare_outbound(
+            task=task,
+            auth=auth,
+            receiver=generation_service.actual_receiver(adapter),
+            requirement_text=requirement.content,
+            feedback_texts=body.feedback,
+            source_items=items,
+            model=request.app.state.settings.dashscope_model,
+        )
+    except GenerationBlocked as exc:
+        http_error(423 if exc.code == "baseline_unavailable" else 409, exc.code, exc.code)
+    except OutboundDenied as exc:
+        http_error(403, "outbound_denied", exc.code)
+    return {
+        "receiver": prepared.receiver,
+        "data_types": prepared.data_types,
+        "request_digest": prepared.request_digest,
+        "requirement": {
+            "sha256": __import__("hashlib").sha256(requirement.content.encode("utf-8")).hexdigest(),
+            "chars": len(requirement.content),
+        },
+        "feedback": [
+            {"sha256": __import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
+             "chars": len(text)}
+            for text in body.feedback
+        ],
+        "source": [
+            {"path": item["path"], "sha256": item["sha256"], "bytes": len(item["content"].encode("utf-8"))}
+            for item in items
+        ],
+        "snapshot": {
+            "digest": materialization.digest,
+            "files": [f["path"] for f in materialization.files],
+            "excluded": list(materialization.excluded)
+            + [{"path": path, "reason": "binary"} for path in binary_skipped],
+            "warnings": materialization.warnings,
+        },
     }
 
 
@@ -223,9 +307,14 @@ def send_audit(
             {
                 "id": record.id,
                 "authorization_id": record.authorization_id,
+                "attempt_id": record.attempt_id,
+                "phase": record.phase,
+                "receiver": record.receiver,
                 "payload_manifest": record.payload_manifest,
                 "content_digest": record.content_digest,
                 "payload_digest": record.payload_digest,
+                "request_digest": record.request_digest,
+                "error_code": record.error_code,
             }
             for record in records
         ]

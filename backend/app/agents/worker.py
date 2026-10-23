@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 from pathlib import Path
@@ -161,7 +162,7 @@ class WorkerAgentAdapter(AgentAdapter):
                 raise AdapterCancelled(
                     "worker terminated", sent=bool(result.get("sent"))
                 )
-            raise AdapterResponseError(error)
+            raise AdapterResponseError(error, sent=bool(result.get("sent")))
         response = result.get("response")
         if not isinstance(response, dict):
             raise AdapterResponseError("response_not_object")
@@ -211,6 +212,12 @@ class WorkerAgentAdapter(AgentAdapter):
             cost={"amount": None, "currency": None, "basis": "unknown"},
             terminal_status="completed",
             tool_call_log=[],
+            send_evidence={
+                "transport": "worker-synthetic" if self.synthetic else "worker-real",
+                "sent": bool(result.get("sent")),
+                "confirmed": True,
+                "response_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            },
         )
 
     def cancel(self, execution_id: str) -> CancelOutcome:

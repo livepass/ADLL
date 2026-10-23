@@ -175,7 +175,11 @@ def test_generation_audit_persists_payload_digest(tmp_path, app_factory) -> None
 
     db = app.state.db.session()
     try:
-        record = db.query(SendAuditRecord).filter_by(execution_id=str(execution_id)).one()
+        record = (
+            db.query(SendAuditRecord)
+            .filter_by(execution_id=str(execution_id), phase="prepared")
+            .one()
+        )
         assert record.authorization_id == auth_id
         assert record.payload_digest
         assert len(record.payload_digest) == 64
@@ -185,4 +189,5 @@ def test_generation_audit_persists_payload_digest(tmp_path, app_factory) -> None
         db.close()
 
     audit = client.get(f"/api/generations/{execution_id}/send-audit").json()["audits"]
-    assert audit[0]["payload_digest"] == record.payload_digest
+    prepared_audit = next(item for item in audit if item["phase"] == "prepared")
+    assert prepared_audit["payload_digest"] == record.payload_digest

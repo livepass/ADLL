@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import sys
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -30,6 +30,20 @@ from .win32 import (
     restore_acl,
     spawn_restricted,
 )
+
+def default_python() -> str:
+    """Interpreter for the restricted child: prefer the base install.
+
+    A venv redirector needs a readable `pyvenv.cfg` next to itself; after the
+    project ACL hardening the checkout is intentionally unreadable to the
+    restricted token. The base interpreter only needs the stdlib, which is
+    world-readable and is what production staging pins as well.
+    """
+    base = getattr(sys, "_base_executable", None)
+    if base and Path(base).is_file():
+        return str(base)
+    return sys.executable
+
 
 PROBE_SCRIPT = Path(__file__).with_name("probe_main.py")
 WORKER_SCRIPT = Path(__file__).with_name("worker_main.py")
@@ -100,7 +114,7 @@ class IsolationSpec:
     process_timeout_seconds: int = 30
 
     def resolved_python(self) -> str:
-        return self.python_executable or os.sys.executable
+        return self.python_executable or default_python()
 
     def resolved_acl_root(self) -> Path:
         return Path(self.acl_root or self.sandbox_root)
@@ -138,14 +152,20 @@ class Sandbox:
                 }) from primary
             raise
 
-    def _allow_restricted_read(self, path: Path) -> None:
+    def _allow_restricted_read(
+        self, path: Path, *, rights: str = "ReadAndExecute, Synchronize"
+    ) -> None:
         """Give both halves of the restricted access check a direct ACE.
 
         A restricted token must pass the normal check and the restricting-SID
         check. Windows/CRT-created files can carry a protected default DACL
         that neither inherits the parent's restricting-SID ACE nor grants the
         owner (OWNER RIGHTS). Write both an OWNER RIGHTS Allow and a
-        restricting-SID Allow on every parent-created file the child reads.
+        restricting-SID Allow on every parent-created object the child reads.
+
+        Default is read+execute only: the worker must never be able to modify
+        the scripts or the authorized subset it executes/reads. `work_dir` is
+        the single exception and gets Modify explicitly.
         """
         acl_root = self.spec.resolved_acl_root()
         # Parent account SID covers the normal check even if the file owner
@@ -153,8 +173,30 @@ class Sandbox:
         # safety net, and the random SID covers the restricting check.
         for sid in (self.parent_sid, "S-1-3-4", self.restricting_sid):
             self._acl_changes.append(
-                allow_sid(path, sid, acl_root, root_allowed=True)
+                allow_sid(path, sid, acl_root, rights=rights, root_allowed=True)
             )
+
+    def _stage_script(self, source: Path, name: str) -> tuple[Path, str]:
+        """Copy the stdlib-only script into the sandbox (read-only for worker).
+
+        The project checkout may be unreadable to the restricted token (and a
+        worker-writable path must never supply executable code). The sandbox
+        copy is byte-identical, hash-recorded, and granted read+execute only.
+        """
+        data = source.read_bytes()
+        target = self.script_dir / name
+        target.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        self._allow_restricted_read(target)
+        return target, digest
+
+    @staticmethod
+    def _script_tampered(path: Path, expected_sha256: str) -> bool:
+        """Re-hash the staged script immediately before every launch."""
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256
+        except OSError:
+            return True
 
     def _allow_traverse(self, path: Path) -> None:
         """Grant the restricted token traverse-only access to an ancestor.
@@ -193,8 +235,10 @@ class Sandbox:
         self.root = Path(tempfile.mkdtemp(dir=root_base, prefix="adll-worker-"))
         self.subset_dir = self.root / "subset"
         self.work_dir = self.root / "work"
+        self.script_dir = self.root / "scripts"
         self.subset_dir.mkdir()
         self.work_dir.mkdir()
+        self.script_dir.mkdir()
         self.restricting_sid = self.spec.restricting_sid or generate_restricting_sid()
         self.parent_sid = current_user_sid()
         acl_root = self.spec.resolved_acl_root()
@@ -207,8 +251,16 @@ class Sandbox:
         # 显式授予受限 SID 对 sandbox 的读写。子目录在授予前已创建，且父级
         # DACL 可能是受保护/仅 OWNER RIGHTS 的受保护描述符；不依赖继承传播，
         # 对 root/subset/work 分别写 ACE，避免受限子进程在启动阶段被拒绝。
-        for allowed_path in (self.root, self.subset_dir, self.work_dir):
-            self._allow_restricted_read(allowed_path)
+        # 可执行代码与授权子集只读；只有 work_dir 允许 worker 写结果。
+        for read_only_path in (self.root, self.subset_dir, self.script_dir):
+            self._allow_restricted_read(read_only_path)
+        self._allow_restricted_read(self.work_dir, rights="Modify, Synchronize")
+        self.probe_script, self.probe_script_sha256 = self._stage_script(
+            PROBE_SCRIPT, "probe_main.py"
+        )
+        self.worker_script, self.worker_script_sha256 = self._stage_script(
+            WORKER_SCRIPT, "worker_main.py"
+        )
         for path in self.spec.deny_read:
             self._acl_changes.append(
                 deny_sid(Path(path), self.restricting_sid, acl_root)
@@ -249,8 +301,12 @@ class Sandbox:
         info = {
             "python_executable": python,
             "python_executable_exists": Path(python).is_file(),
-            "probe_script": str(PROBE_SCRIPT),
-            "probe_script_exists": PROBE_SCRIPT.is_file(),
+            "probe_script": str(self.probe_script),
+            "probe_script_exists": self.probe_script.is_file(),
+            "probe_script_sha256": self.probe_script_sha256,
+            "worker_script_sha256": self.worker_script_sha256,
+            "python_is_base_install": Path(python).resolve()
+            == Path(default_python()).resolve(),
             "work_dir": str(self.work_dir),
             "parent_sid": self.parent_sid,
             "spec_exists": spec_path.is_file(),
@@ -301,6 +357,8 @@ class Sandbox:
                 for index, path in enumerate(deny_write)
             ],
         }
+        if self._script_tampered(self.probe_script, self.probe_script_sha256):
+            return ProbeResult(False, {"error": "script_tampered"}, "script_tampered")
         spec_path = self.work_dir / "probe_spec.json"
         out_path = self.work_dir / "probe_evidence.json"
         stdout_path = self.work_dir / "probe_stdout.txt"
@@ -335,7 +393,7 @@ class Sandbox:
 
         try:
             process = spawn_restricted(
-                [self.spec.resolved_python(), "-I", str(PROBE_SCRIPT), str(spec_path), str(out_path)],
+                [self.spec.resolved_python(), "-I", str(self.probe_script), str(spec_path), str(out_path)],
                 cwd=self.work_dir,
                 env=_probe_environment(),
                 restricting_sid=self.restricting_sid,
@@ -395,6 +453,8 @@ class Sandbox:
         env_extra: dict[str, str] | None = None,
         body_bytes: bytes | None = None,
     ) -> dict:
+        if self._script_tampered(self.worker_script, self.worker_script_sha256):
+            return {"ok": False, "error": "script_tampered", "sent": False}
         job_path = self.work_dir / "job.json"
         result_path = self.work_dir / "result.json"
         sent_marker = self.work_dir / "sent.marker"
@@ -458,7 +518,7 @@ class Sandbox:
         process = None
         try:
             process = spawn_restricted(
-                [self.spec.resolved_python(), "-I", str(WORKER_SCRIPT), str(job_path), str(result_path)],
+                [self.spec.resolved_python(), "-I", str(self.worker_script), str(job_path), str(result_path)],
                 cwd=self.work_dir,
                 env=env,
                 restricting_sid=self.restricting_sid,

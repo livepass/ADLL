@@ -147,6 +147,8 @@ def test_installer_parses_under_windows_powershell_51():
 
 
 def test_candidate_staging_matches_its_manifest():
+    if not (CANDIDATE / 'manifest.json').is_file():
+        pytest.skip('local staging candidate is not part of the repository')
     manifest = json.loads((CANDIDATE / 'manifest.json').read_text(encoding='utf-8'))
     for name, digest in manifest['files'].items():
         assert sha256(CANDIDATE / name) == digest.lower(), name
@@ -154,6 +156,8 @@ def test_candidate_staging_matches_its_manifest():
 
 
 def test_installer_pins_the_candidate_bytes():
+    if not (CANDIDATE / 'manifest.json').is_file():
+        pytest.skip('local staging candidate is not part of the repository')
     text = INSTALLER.read_text(encoding='utf-8')
     expected = hashtable_literal(text, 'expected')
     assert expected['scripts/create_adll_probe_account.ps1'] == sha256(SCRIPT).upper()

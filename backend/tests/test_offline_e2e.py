@@ -43,7 +43,7 @@ def test_offline_end_to_end_mock_workflow(tmp_path, app_factory) -> None:
 
     authorization = client.post(
         f"/api/tasks/{task['id']}/outbound-authorizations",
-        json={"receiver": "dashscope", "send_scope": {"paths": ["a.txt"]}},
+        json={"receiver": "mock://local", "send_scope": {"paths": ["a.txt"]}},
         headers=csrf_headers(csrf, "e2e-auth"),
     ).json()["authorization"]
 
@@ -74,7 +74,7 @@ def test_offline_end_to_end_mock_workflow(tmp_path, app_factory) -> None:
     assert detail["execution"]["cost"]["amount"] is None
 
     audit = client.get(f"/api/generations/{execution_id}/send-audit").json()["audits"]
-    assert len(audit) == 1
+    assert [item["phase"] for item in audit] == ["prepared", "confirmed_sent"]
     assert audit[0]["payload_manifest"]["source"] == [
         {
             "path": "a.txt",

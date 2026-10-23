@@ -66,7 +66,8 @@ def test_append_only_trigger(app) -> None:
     db = _session(app.state.db)
     try:
         auth = OutboundAuthorization(
-            receiver="dashscope", data_types=["requirement"], send_scope={"k": 1},
+            receiver="https://example.invalid/v1/messages", data_types=["requirement"],
+            send_scope={"paths": ["a.txt"]},
             status="approved",
         )
         db.add(auth)

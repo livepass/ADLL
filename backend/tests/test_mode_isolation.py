@@ -59,7 +59,12 @@ def test_real_ai_enabled_but_isolation_unverified_blocks(tmp_path) -> None:
         json={"content": "需求"},
         headers=csrf_headers(csrf, "k-req"),
     )
-    auth_id = seed_authorization(app, task["id"], scope={"paths": ["a.txt"]})
+    auth_id = seed_authorization(
+        app,
+        task["id"],
+        scope={"paths": ["a.txt"]},
+        receiver="https://dashscope.aliyuncs.com/apps/anthropic/v1/messages",
+    )
     resp = client.post(
         f"/api/tasks/{task['id']}/generations",
         json={"authorization_id": auth_id},

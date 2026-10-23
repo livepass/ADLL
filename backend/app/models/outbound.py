@@ -1,18 +1,25 @@
 """出站授权与发送审计（T011）。
 
 - `OutboundAuthorization`：receiver/data_types/send_scope/状态/有效期；默认未批准即拒绝。
-- `SendAuditRecord`：append-only（数据库触发器保护）；四类 payload_manifest
-  （需求/反馈/源码/工具返回），候选 C 下「工具返回」恒空。
+- `SendAuditRecord`：append-only（数据库触发器保护）；一次发送尝试由多行事件组成，
+  以 `attempt_id` 关联，`phase` 区分：
+    prepared        —— 已持久化请求摘要与载荷清单，尚未调用网络
+    possibly_sent   —— 请求可能已写出（超时/HTTP 错误/取消中断），无成功响应证据
+    confirmed_sent  —— 收到成功响应，可确认已发送
+    not_sent        —— 发送前失败或被取消，确认未写出
+  四类 payload_manifest（需求/反馈/源码/工具返回），候选 C 下「工具返回」恒空。
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, utcnow
 from .enums import OutboundStatus
+
+SEND_PHASES = ("prepared", "possibly_sent", "confirmed_sent", "not_sent")
 
 
 class OutboundAuthorization(Base):
@@ -42,8 +49,16 @@ class SendAuditRecord(Base):
         ForeignKey("outbound_authorizations.id"), nullable=False
     )
     execution_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 同一次发送尝试的所有事件共享 attempt_id。
+    attempt_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    phase: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="confirmed_sent"
+    )
+    receiver: Mapped[str | None] = mapped_column(String(200), nullable=True)
     payload_manifest: Mapped[dict] = mapped_column(JSON, nullable=False)
     # manifest 摘要（四类内容）与完整 HTTP JSON 请求体摘要分开记录。
     content_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

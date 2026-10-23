@@ -11,6 +11,10 @@ from app.config import Settings
 
 ADMIN_PW = "test-password-123"
 
+# 接收方必须是完整端点；Mock 与测试用适配器各自有固定端点。
+RECEIVER_MOCK = "mock://local"
+RECEIVER_WORKER = "https://example.invalid/v1/messages"
+
 
 def make_settings(
     database_url: str,
@@ -80,7 +84,7 @@ def seed_authorization(
     app,
     task_id: int,
     *,
-    receiver: str = "dashscope",
+    receiver: str = RECEIVER_MOCK,
     data_types=None,
     scope=None,
     status: str = "approved",
@@ -99,7 +103,7 @@ def seed_authorization(
             baseline_id=task.baseline_id,
             receiver=receiver,
             data_types=data_types or ["requirement", "feedback", "source"],
-            send_scope=scope or {"paths": ["a.txt"]},
+            send_scope=scope if scope is not None else {"paths": ["a.txt"]},
             status=status,
             revoked_at=revoked_at,
             expires_at=expires_at,

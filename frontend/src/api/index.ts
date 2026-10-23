@@ -153,6 +153,27 @@ export interface SnapshotSummary {
   lfs_pointers: string[]
 }
 
+export interface OutboundReceiver {
+  receiver: string
+  model: string
+  testing: boolean
+}
+
+export interface PreviewResponse {
+  receiver: string
+  data_types: string[]
+  request_digest: string
+  requirement: { sha256: string; chars: number }
+  feedback: { sha256: string; chars: number }[]
+  source: { path: string; sha256: string; bytes: number }[]
+  snapshot: {
+    digest: string
+    files: string[]
+    excluded: { path: string; reason: string }[]
+    warnings: string[]
+  }
+}
+
 export interface StartGenerationResponse {
   execution_id: number
   status: string
@@ -169,6 +190,11 @@ export interface CancelResponse {
 export interface SendAudit {
   id: number
   authorization_id: number | null
+  attempt_id?: string | null
+  phase?: string
+  receiver?: string | null
+  request_digest?: string | null
+  error_code?: string | null
   payload_manifest: {
     requirement?: string[]
     feedback?: string[]
@@ -227,6 +253,7 @@ export const api = {
 
   listAuthorizations: (taskId: number) =>
     apiGet<{ authorizations: Authorization[] }>(`/tasks/${taskId}/outbound-authorizations`),
+  outboundReceiver: () => apiGet<OutboundReceiver>('/outbound/receiver'),
   createAuthorization: (
     taskId: number,
     body: { receiver: string; data_types: string[]; send_scope: Record<string, unknown> },
@@ -234,12 +261,22 @@ export const api = {
   revokeAuthorization: (authorizationId: number) =>
     apiPost<{ authorization: Authorization }>(`/outbound-authorizations/${authorizationId}/revoke`),
 
-  startGeneration: (taskId: number, authorizationId: number, feedback: string[]) =>
-    apiPost<StartGenerationResponse>(
-      `/tasks/${taskId}/generations`,
-      { authorization_id: authorizationId, feedback },
-      undefined,
-    ),
+  previewGeneration: (taskId: number, authorizationId: number, feedback: string[] = []) =>
+    apiPost<PreviewResponse>(`/tasks/${taskId}/generations/preview`, {
+      authorization_id: authorizationId,
+      feedback,
+    }),
+  startGeneration: (
+    taskId: number,
+    authorizationId: number,
+    feedback: string[],
+    previewDigest?: string,
+  ) =>
+    apiPost<StartGenerationResponse>(`/tasks/${taskId}/generations`, {
+      authorization_id: authorizationId,
+      feedback,
+      preview_digest: previewDigest,
+    }),
   getGeneration: (executionId: number) => apiGet<GenerationDetail>(`/generations/${executionId}`),
   cancelGeneration: (executionId: number) =>
     apiPost<CancelResponse>(`/generations/${executionId}/cancel`),

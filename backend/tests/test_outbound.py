@@ -12,15 +12,16 @@ from app.services import outbound
 
 TASK = 1
 BASELINE = 1
+RECEIVER = "https://example.invalid/v1/messages"
 
 
 def _make(db, **kwargs):
     auth = OutboundAuthorization(
         task_id=kwargs.get("task_id", TASK),
         baseline_id=kwargs.get("baseline_id", BASELINE),
-        receiver=kwargs.get("receiver", "dashscope"),
+        receiver=kwargs.get("receiver", RECEIVER),
         data_types=kwargs.get("data_types", ["requirement", "source"]),
-        send_scope=kwargs.get("send_scope", {"kind": "task", "id": 1}),
+        send_scope=kwargs.get("send_scope", {"paths": ["a.txt"]}),
         status=kwargs.get("status", "approved"),
         revoked_at=kwargs.get("revoked_at"),
         expires_at=kwargs.get("expires_at"),
@@ -36,9 +37,9 @@ def _eval(auth, **kw):
         auth,
         task_id=kw.get("task_id", TASK),
         baseline_id=kw.get("baseline_id", BASELINE),
-        receiver=kw.get("receiver", "dashscope"),
+        receiver=kw.get("receiver", RECEIVER),
         data_types=kw.get("data_types", ["requirement"]),
-        scope=kw.get("scope", {"kind": "task", "id": 1}),
+        scope=kw.get("scope", {"paths": ["a.txt"]}),
     )
 
 
@@ -93,7 +94,7 @@ def test_baseline_mismatch_denied(app) -> None:
 def test_receiver_mismatch_denied(app) -> None:
     db = app.state.db.session()
     try:
-        assert _eval(_make(db), receiver="other").code == "receiver_mismatch"
+        assert _eval(_make(db), receiver="https://other.invalid/v1/messages").code == "receiver_mismatch"
     finally:
         db.close()
 
@@ -110,7 +111,7 @@ def test_data_type_not_authorized_denied(app) -> None:
 def test_scope_mismatch_denied(app) -> None:
     db = app.state.db.session()
     try:
-        assert _eval(_make(db), scope={"kind": "other"}).code == "scope_mismatch"
+        assert _eval(_make(db), scope={"paths": ["other.txt"]}).code == "scope_mismatch"
     finally:
         db.close()
 

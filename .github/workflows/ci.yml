@@ -7,7 +7,11 @@ on:
 
 jobs:
   backend:
-    runs-on: ubuntu-latest
+    # requirements.lock 固定的是 py3.12 win_amd64 wheel 的 SHA-256
+    # （例如 MarkupSafe 3.0.4 = markupsafe-3.0.4-cp312-cp312-win_amd64.whl），
+    # 在 Linux 上 --require-hashes 必然失败。受限 worker 的 DACL/Job Object
+    # 证据也只在 Windows 上可执行，因此后端固定用 windows-latest。
+    runs-on: windows-latest
     defaults:
       run:
         working-directory: backend
@@ -17,7 +21,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install pinned dependencies
-        run: pip install --require-hashes -r requirements.lock
+        run: python -m pip install --require-hashes -r requirements.lock
       - name: Migrate from zero
         env:
           ADLL_DATABASE_URL: sqlite:///./ci.db

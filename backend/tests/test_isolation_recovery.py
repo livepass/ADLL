@@ -114,9 +114,10 @@ def test_constructor_failure_rolls_back(tmp_path, monkeypatch, cleanup_fails):
     monkeypatch.setattr(sb, 'restore_acl', restore)
     with pytest.raises(win32.AclOperationError) as caught:
         sb.Sandbox(sb.IsolationSpec(tmp_path, deny_read=(tmp_path / 'object',)))
-    # one Users-Traverse on the shared acl_root, plus
-    # (parent SID + OWNER RIGHTS + restricting SID) x root/subset/work
-    assert len(restored) == 10
+    # 1 Users-Traverse (acl_root == root_base here) +
+    # (parent SID + OWNER RIGHTS + restricting SID) x (root/subset/scripts/work) +
+    # same 3 SIDs x (probe_main.py, worker_main.py)
+    assert len(restored) == 19
     if cleanup_fails:
         assert caught.value.diagnostic['operation'] == 'sandbox_initialize'
         assert list(tmp_path.iterdir())  # Preserve scene after failed rollback.

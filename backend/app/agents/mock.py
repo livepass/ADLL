@@ -40,6 +40,14 @@ class MockAgentAdapter(AgentAdapter):
             },
             terminal_status="completed",
             tool_call_log=[],  # 候选 C：无工具
+            send_evidence={
+                "transport": "mock",
+                "sent": True,
+                "confirmed": True,
+                "response_digest": __import__("hashlib").sha256(
+                    text.encode("utf-8")
+                ).hexdigest(),
+            },
         )
 
     def cancel(self, execution_id: str) -> CancelOutcome:
@@ -50,7 +58,13 @@ class MockAgentAdapter(AgentAdapter):
 
     def capabilities(self) -> AdapterCapabilities:
         return AdapterCapabilities(
-            {"mock": True, "tools": False, "network": False, "real_model": False}
+            {
+                "mock": True,
+                "tools": False,
+                "network": False,
+                "real_model": False,
+                "endpoint": "mock://local",
+            }
         )
 
     def self_check(self) -> BoundaryCheckReport:

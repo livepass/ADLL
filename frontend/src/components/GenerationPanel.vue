@@ -82,7 +82,9 @@
       <div v-if="audits.length">
         <article v-for="audit in audits" :key="audit.id" class="audit">
           <p class="muted">
-            audit #{{ audit.id }} · authorization={{ audit.authorization_id ?? '—' }}
+            audit #{{ audit.id }} · {{ audit.phase || 'confirmed_sent' }} ·
+            authorization={{ audit.authorization_id ?? '—' }}
+            <span v-if="audit.error_code"> · error={{ audit.error_code }}</span>
           </p>
           <p>content_digest（manifest） <span class="hash">{{ audit.content_digest }}</span></p>
           <p v-if="audit.payload_digest">
@@ -247,7 +249,14 @@ async function start(): Promise<void> {
   audits.value = []
   try {
     const feedback = feedbackText.value.split('\n').map((line) => line.trim()).filter(Boolean)
-    const result = await api.startGeneration(props.taskId, auth.id, feedback)
+    // 先取预览摘要并在请求中回传：真实发送必须与用户看到的范围/内容一致。
+    const preview = await api.previewGeneration(props.taskId, auth.id, feedback)
+    const result = await api.startGeneration(
+      props.taskId,
+      auth.id,
+      feedback,
+      preview.request_digest,
+    )
     snapshot.value = result.snapshot
     detail.value = null
     emit('executionSelected', result.execution_id)

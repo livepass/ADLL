@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import urllib.error
@@ -25,15 +26,27 @@ from .base import (
 
 
 class AdapterDisabled(RuntimeError):
-    pass
+    """发送前即失败：确认未写出任何请求。"""
+
+    def __init__(self, message: str = "adapter disabled", *, sent: bool = False) -> None:
+        super().__init__(message)
+        self.sent = sent
 
 
 class AdapterTimeout(RuntimeError):
-    pass
+    """请求可能已写出但未收到响应；默认按“可能已发送”处理。"""
+
+    def __init__(self, message: str = "request timed out", *, sent: bool = True) -> None:
+        super().__init__(message)
+        self.sent = sent
 
 
 class AdapterResponseError(RuntimeError):
-    pass
+    """响应不可用；`sent` 表示请求是否已写出。"""
+
+    def __init__(self, message: str = "adapter error", *, sent: bool = True) -> None:
+        super().__init__(message)
+        self.sent = sent
 
 
 class AdapterCancelled(RuntimeError):
@@ -98,7 +111,7 @@ class DashscopeAgentAdapter(AgentAdapter):
         if not self.enabled:
             raise AdapterDisabled("real AI sending disabled (fail-closed)")
         if not isinstance(request.payload, dict):
-            raise AdapterResponseError("host-assembled payload required")
+            raise AdapterResponseError("host-assembled payload required", sent=False)
         if sink is not None:
             sink.emit({"type": "start"})
         try:
@@ -151,6 +164,12 @@ class DashscopeAgentAdapter(AgentAdapter):
             cost={"amount": None, "currency": None, "basis": "unknown"},
             terminal_status="completed",
             tool_call_log=[],  # 候选 C：无工具
+            send_evidence={
+                "transport": "synthetic" if self.synthetic_transport else "urllib",
+                "sent": True,
+                "confirmed": True,
+                "response_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            },
         )
 
     def cancel(self, execution_id: str) -> CancelOutcome:
