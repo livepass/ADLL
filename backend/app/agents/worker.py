@@ -124,6 +124,9 @@ class WorkerAgentAdapter(AgentAdapter):
             env_extra["DASHSCOPE_API_KEY"] = key
         if sink is not None:
             sink.emit({"type": "start"})
+        body_bytes = (
+            canonical_payload_bytes(request.payload) if mode == "real" else None
+        )
         job = {
             "mode": mode,
             "synthetic_allowed": self.synthetic,
@@ -133,20 +136,15 @@ class WorkerAgentAdapter(AgentAdapter):
             "requirement": request.requirement_text,
             "timeout": self.timeout,
         }
+        if body_bytes is not None:
+            # worker 在发送前重算该摘要：授权通道与审计摘要是同一字节序列。
+            job["request_digest"] = hashlib.sha256(body_bytes).hexdigest()
         key = str(request.execution_id or request.idempotency_key or id(request))
         with Sandbox(self._spec()) as sandbox:
             with self._active_lock:
                 self._active[key] = sandbox
             try:
-                result = sandbox.run(
-                    job,
-                    env_extra=env_extra,
-                    body_bytes=(
-                        canonical_payload_bytes(request.payload)
-                        if mode == "real"
-                        else None
-                    ),
-                )
+                result = sandbox.run(job, env_extra=env_extra, body_bytes=body_bytes)
             finally:
                 with self._active_lock:
                     self._active.pop(key, None)

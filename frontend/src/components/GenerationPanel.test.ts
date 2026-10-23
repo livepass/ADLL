@@ -38,6 +38,13 @@ const PREVIEW: PreviewResponse = {
   testing: true,
   data_types: ['requirement', 'source'],
   request_digest: 'a'.repeat(64),
+  request_body: {
+    content:
+      '{"max_tokens":256,"messages":[{"content":"## Requirement\\n需求\\n## Source\\n### a.txt\\nalpha-beta","role":"user"}],"model":"qwen-test","stream":false,"thinking":{"type":"disabled"}}',
+    sha256: 'a'.repeat(64),
+    bytes: 179,
+    canonical: 'json/utf-8, sorted keys, compact separators',
+  },
   message: {
     content: '## Requirement\n需求\n## Source\n### a.txt\nalpha-beta',
     sha256: 'b'.repeat(64),
@@ -127,10 +134,12 @@ describe('GenerationPanel preview/confirm gate', () => {
     expect(mocks.startGeneration).not.toHaveBeenCalled()
     expect(wrapper.get('[data-test="send"]').attributes('disabled')).toBeUndefined()
 
-    // 完整内容可见（不是只给哈希）
+    // 完整内容可见（不是只给哈希）：正文、完整请求体、模型
     expect(wrapper.text()).toContain('alpha-beta')
     expect(wrapper.text()).toContain('## Requirement')
     expect(wrapper.text()).toContain('qwen-test')
+    expect(wrapper.text()).toContain('max_tokens')
+    expect(wrapper.text()).toContain('messages[0].content')
 
     await wrapper.get('[data-test="send"]').trigger('click')
     await flushPromises()
@@ -188,6 +197,44 @@ describe('GenerationPanel preview/confirm gate', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-test="send"]').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+})
+
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+describe('GenerationPanel stale preview', () => {
+  beforeEach(() => {
+    runtime.testing = true
+    runtime.realAiEnabled = false
+    mocks.startGeneration.mockReset()
+    mocks.getGeneration.mockReset().mockResolvedValue(DETAIL)
+  })
+
+  it('does not treat a late preview response as current after feedback changes', async () => {
+    const pending = deferred<PreviewResponse>()
+    mocks.previewGeneration.mockReset().mockReturnValue(pending.promise)
+    const wrapper = mountPanel()
+
+    const clicking = wrapper.get('[data-test="preview"]').trigger('click')
+    // 请求在途时修改反馈
+    await wrapper.get('[data-test="feedback"]').setValue('补充说明')
+    pending.resolve(PREVIEW)
+    await clicking
+    await flushPromises()
+
+    expect(wrapper.get('[data-test="send"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('原预览确认已失效')
+    await wrapper.get('[data-test="send"]').trigger('click')
+    await flushPromises()
+    expect(mocks.startGeneration).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 })

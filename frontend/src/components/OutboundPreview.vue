@@ -18,10 +18,20 @@
     </dl>
 
     <details class="part" open>
-      <summary>待发送正文（与 HTTP 请求体逐字一致 · {{ preview.message.bytes }} B）</summary>
+      <summary>完整请求体（规范化 JSON · {{ preview.request_body.bytes }} B）</summary>
       <p class="muted">
-        sha256 <span class="hash">{{ preview.message.sha256 }}</span> ·
-        下方内容可滚动查看全文，不是哈希占位。
+        sha256 <span class="hash">{{ preview.request_body.sha256 }}</span> ·
+        规范化：{{ preview.request_body.canonical }}。
+        这是 transport 实际发送的同一字节序列；可复制后自行 `sha256` 复核。
+      </p>
+      <pre class="wire wire-body">{{ preview.request_body.content }}</pre>
+    </details>
+
+    <details class="part">
+      <summary>messages[0].content 正文（{{ preview.message.bytes }} B）</summary>
+      <p class="muted">
+        这是请求体中 <code>messages[0].content</code> 的同一条文本，<strong>不是</strong>完整
+        HTTP 请求体；完整请求体见上一节（含 model / max_tokens / thinking / stream）。
       </p>
       <pre class="wire">{{ preview.message.content }}</pre>
     </details>

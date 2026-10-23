@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -33,6 +34,22 @@ def _opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
+def body_digest_error(job: dict, body: bytes) -> str | None:
+    """Check the bytes about to be sent against the audited request digest.
+
+    The parent records `request_digest` in the send audit; the worker recomputes
+    it here so an authorized channel and the audit row refer to the same bytes.
+    Returns an error code, or None when they match.
+    """
+    expected = job.get("request_digest")
+    if not isinstance(expected, str) or not expected:
+        return "request_digest_missing"
+    actual = hashlib.sha256(body).hexdigest()
+    if actual != expected:
+        return "body_digest_mismatch"
+    return None
+
+
 def _real_call(job: dict) -> dict:
     if os.environ.get("ADLL_WORKER_REAL_TRANSPORT") != "1":
         return {"ok": False, "error": "real_transport_disabled"}
@@ -55,6 +72,10 @@ def _real_call(job: dict) -> dict:
         body = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
+    digest_error = body_digest_error(job, body)
+    if digest_error is not None:
+        # 摘要不符 → 零发送：不能把与审计不一致的字节发出去。
+        return {"ok": False, "error": digest_error}
     # 发送前落一个标记：父进程终止 worker 后据此如实区分是否已发出。
     work_dir = Path(job.get("work_dir") or Path(sys.argv[1]).parent)
     marker = work_dir / "sent.marker"

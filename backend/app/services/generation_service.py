@@ -164,6 +164,17 @@ def _run_body(
         db.commit()
         return None, None
 
+    # 授权可能在 prepare 之后、真正发送之前被撤销/过期：发送前最后再查一次。
+    # 这里直接失败退出，不写发送审计（审计的绑定检查也会拒绝已撤销的授权）。
+    try:
+        db.refresh(auth)
+    except Exception:  # noqa: BLE001 — 行已不存在时按“无授权”处理
+        auth = None
+    revocation = outbound.inactive_reason(auth)
+    if revocation is not None:
+        _finish(db, execution, "failed", f"authorization_{revocation}")
+        return None, None
+
     try:
         attempt_id = _record_attempt(
             db,

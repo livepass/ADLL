@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import json
 
 from tests.helpers import csrf_headers, login_client, make_repo
 
@@ -162,6 +164,18 @@ def test_preview_shows_scope_and_digests_without_sending(tmp_path, app_factory) 
         hashlib.sha256(body["message"]["content"].encode("utf-8")).hexdigest()
         == body["message"]["sha256"]
     )
+
+    # 完整请求体：规范化 JSON 的 sha256 必须等于 request_digest，且可被人工重算。
+    request_body = body["request_body"]
+    assert "max_tokens" in request_body["content"]
+    assert "messages" in request_body["content"]
+    assert request_body["sha256"] == body["request_digest"]
+    assert (
+        hashlib.sha256(request_body["content"].encode("utf-8")).hexdigest()
+        == body["request_digest"]
+    )
+    assert len(request_body["content"].encode("utf-8")) == request_body["bytes"]
+    assert json.loads(request_body["content"])["messages"][0]["content"] == body["message"]["content"]
 
 
 def test_preview_digest_changes_when_feedback_changes(tmp_path, app_factory) -> None:

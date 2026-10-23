@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, utcnow
@@ -43,6 +43,16 @@ class OutboundAuthorization(Base):
 
 class SendAuditRecord(Base):
     __tablename__ = "send_audit_records"
+    __table_args__ = (
+        # 一次尝试最多一个终态：即使应用层检查与并发终结发生竞态，
+        # 数据库也会拒绝第二个终态，避免审计历史自相矛盾。
+        Index(
+            "ux_send_attempt_terminal",
+            "attempt_id",
+            unique=True,
+            sqlite_where=text("attempt_id IS NOT NULL AND phase <> 'prepared'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     authorization_id: Mapped[int] = mapped_column(

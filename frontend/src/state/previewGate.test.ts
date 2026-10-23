@@ -10,11 +10,21 @@ const PREVIEW: PreviewResponse = {
   testing: true,
   data_types: ['requirement'],
   request_digest: 'a'.repeat(64),
+  request_body: {
+    content: '{"messages":[{"content":"## Requirement\\n需求"}],"model":"m"}',
+    sha256: 'a'.repeat(64),
+    bytes: 62,
+    canonical: 'json/utf-8, sorted keys, compact separators',
+  },
   message: { content: '## Requirement\n需求', sha256: 'b'.repeat(64), bytes: 18 },
   requirement: { sha256: 'c'.repeat(64), chars: 2, bytes: 6, content: '需求' },
   feedback: [],
   source: [],
   snapshot: { digest: 'd'.repeat(64), files: [], excluded: [], warnings: [] },
+}
+
+function loadOnce(gate: ReturnType<typeof usePreviewGate>, preview = PREVIEW): boolean {
+  return gate.load(preview, gate.begin())
 }
 
 describe('previewGate', () => {
@@ -38,7 +48,7 @@ describe('previewGate', () => {
     expect(gate.fresh.value).toBe(false)
     expect(() => gate.consume()).toThrowError('preview_stale')
 
-    gate.load(PREVIEW)
+    expect(loadOnce(gate)).toBe(true)
     expect(gate.fresh.value).toBe(true)
     expect(gate.digest.value).toBe(PREVIEW.request_digest)
 
@@ -50,22 +60,51 @@ describe('previewGate', () => {
     expect(() => gate.consume()).toThrowError('preview_stale')
 
     // 重新预览后恢复
-    gate.load(PREVIEW)
+    expect(loadOnce(gate)).toBe(true)
     expect(gate.consume()).toEqual({ digest: PREVIEW.request_digest, feedback: ['补充'] })
   })
 
   it('switching task or authorization also invalidates', () => {
     const input = ref({ taskId: 1, authorizationId: 2, feedback: [] as string[] })
     const gate = usePreviewGate(() => input.value)
-    gate.load(PREVIEW)
+    loadOnce(gate)
     expect(gate.fresh.value).toBe(true)
 
     input.value = { ...input.value, taskId: 3 }
     expect(gate.fresh.value).toBe(false)
 
     input.value = { taskId: 1, authorizationId: 2, feedback: [] }
-    gate.load(PREVIEW)
+    loadOnce(gate)
     input.value = { ...input.value, authorizationId: 5 }
     expect(gate.fresh.value).toBe(false)
+  })
+
+  it('a response that lands after the inputs changed is accepted but stale', () => {
+    const input = ref({ taskId: 1, authorizationId: 2, feedback: [] as string[] })
+    const gate = usePreviewGate(() => input.value)
+
+    const ticket = gate.begin() // 请求发出时：无反馈
+    input.value = { ...input.value, feedback: ['迟到的修改'] }
+    expect(gate.load(PREVIEW, ticket)).toBe(true)
+
+    // 不能被当成当前预览：发送必须保持禁用
+    expect(gate.fresh.value).toBe(false)
+    expect(gate.dirty.value).toBe(true)
+    expect(() => gate.consume()).toThrowError('preview_stale')
+  })
+
+  it('drops superseded responses and anything after reset', () => {
+    const input = ref({ taskId: 1, authorizationId: 2, feedback: [] as string[] })
+    const gate = usePreviewGate(() => input.value)
+
+    const first = gate.begin()
+    const second = gate.begin()
+    expect(gate.load(PREVIEW, first)).toBe(false)
+    expect(gate.preview.value).toBeNull()
+
+    expect(gate.load(PREVIEW, second)).toBe(true)
+    gate.reset()
+    expect(gate.load(PREVIEW, second)).toBe(false)
+    expect(gate.preview.value).toBeNull()
   })
 })

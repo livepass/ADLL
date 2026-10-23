@@ -179,7 +179,9 @@ export interface PreviewResponse {
   testing: boolean
   data_types: string[]
   request_digest: string
-  /** 最终写入 HTTP 请求体的同一条 message。 */
+  /** 完整规范化请求体（键排序、紧凑分隔符、UTF-8）；sha256 应等于 request_digest。 */
+  request_body: { content: string; sha256: string; bytes: number; canonical: string }
+  /** 请求体中 messages[0].content 的同一条文本（不是完整 body）。 */
   message: { content: string; sha256: string; bytes: number }
   requirement: PreviewTextPart
   feedback: PreviewTextPart[]

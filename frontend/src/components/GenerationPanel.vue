@@ -295,17 +295,22 @@ async function loadPreview(): Promise<void> {
   error.value = ''
   notice.value = ''
   audits.value = []
+  // 记录“请求发出时”的输入指纹与序号：等待期间切换任务/授权/反馈，
+  // 或后发请求先返回，旧结果都不能被当成当前预览。
+  const ticket = gate.begin()
   try {
     const result = await api.previewGeneration(
       props.taskId,
       auth.id,
       feedbackLines(feedbackText.value),
     )
-    gate.load(result)
-    notice.value = '预览已生成。请核对接收方、模型、正文与文件后再点击「确认」。'
+    if (!gate.load(result, ticket)) return
+    notice.value = '预览已生成。请核对接收方、模型、请求体与文件后再点击「确认」。'
   } catch (err) {
-    gate.reset()
-    error.value = describeError(err)
+    if (gate.isCurrent(ticket)) {
+      gate.reset()
+      error.value = describeError(err)
+    }
   } finally {
     previewBusy.value = false
   }

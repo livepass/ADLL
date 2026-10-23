@@ -1,11 +1,14 @@
 """生成执行 API（T031/T033）：异步发起、查询、取消、审计、事件（最小）。"""
 from __future__ import annotations
 
+import hashlib
+
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
 from ..adapters.git import GitAdapter
 from ..agents.factory import NoRealAdapterAvailable
+from ..core.payload import canonical_payload_bytes
 from ..models.generation import GenerationExecution, VerificationAttempt
 from ..models.outbound import OutboundAuthorization
 from ..models.proposal import ProposalVersion
@@ -15,7 +18,8 @@ from ..models.task import Task
 from ..security.deps import get_db, require_user_action, require_user_role
 from ..services import generation_service, outbound, snapshot, task_service
 from ..services.generation_service import GenerationBlocked
-from ..services.outbound_pipeline import OutboundDenied, prepare as prepare_outbound
+from ..services.outbound_pipeline import OutboundDenied
+from ..services.outbound_pipeline import prepare as prepare_outbound
 from .common import http_error, idempotent
 from .serializers import proposal_dict
 
@@ -211,27 +215,39 @@ def preview_generation(
         http_error(403, "outbound_denied", exc.code)
     settings = request.app.state.settings
     wire_text = prepared.payload["messages"][0]["content"]
+    # 规范化请求体：与 transport 实际发送的字节序列一致（键排序、紧凑分隔符、UTF-8）。
+    body_bytes = canonical_payload_bytes(prepared.payload)
+    body_sha256 = hashlib.sha256(body_bytes).hexdigest()
+    if body_sha256 != prepared.request_digest:
+        http_error(500, "digest_invariant_broken", "请求体摘要与规范化序列化不一致")
     return {
         "receiver": prepared.receiver,
         "model": settings.dashscope_model,
         "testing": settings.testing,
         "data_types": prepared.data_types,
         "request_digest": prepared.request_digest,
-        # 逐字确认：这是最终写入 HTTP 请求体的同一条 message。
+        # 完整请求体（规范化 JSON）：供人工逐字核对，不只是 message 内容。
+        "request_body": {
+            "content": body_bytes.decode("utf-8"),
+            "sha256": body_sha256,
+            "bytes": len(body_bytes),
+            "canonical": "json/utf-8, sorted keys, compact separators",
+        },
+        # 逐字确认：这是请求体中 messages[0].content 的同一条文本。
         "message": {
             "content": wire_text,
-            "sha256": __import__("hashlib").sha256(wire_text.encode("utf-8")).hexdigest(),
+            "sha256": hashlib.sha256(wire_text.encode("utf-8")).hexdigest(),
             "bytes": len(wire_text.encode("utf-8")),
         },
         "requirement": {
-            "sha256": __import__("hashlib").sha256(requirement.content.encode("utf-8")).hexdigest(),
+            "sha256": hashlib.sha256(requirement.content.encode("utf-8")).hexdigest(),
             "chars": len(requirement.content),
             "bytes": len(requirement.content.encode("utf-8")),
             "content": requirement.content,
         },
         "feedback": [
             {
-                "sha256": __import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 "chars": len(text),
                 "bytes": len(text.encode("utf-8")),
                 "content": text,

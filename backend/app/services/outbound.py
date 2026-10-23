@@ -16,6 +16,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
+from sqlalchemy.exc import IntegrityError
+
 from ..models.base import utcnow
 from ..models.enums import OutboundStatus
 from ..models.outbound import SEND_PHASES, OutboundAuthorization, SendAuditRecord
@@ -32,13 +34,26 @@ class Decision:
 def _active(auth: OutboundAuthorization | None, now: datetime) -> Decision | None:
     if auth is None:
         return Decision(False, "no_authorization")
-    if auth.status != OutboundStatus.APPROVED.value:
-        return Decision(False, "not_approved")
+    # 先判撤销：撤销同时会改 status 与 revoked_at，取更精确的原因。
     if auth.revoked_at is not None:
         return Decision(False, "revoked")
+    if auth.status != OutboundStatus.APPROVED.value:
+        return Decision(False, "not_approved")
     if auth.expires_at is not None and auth.expires_at <= now:
         return Decision(False, "expired")
     return None
+
+
+def inactive_reason(
+    auth: OutboundAuthorization | None, now: datetime | None = None
+) -> str | None:
+    """Return the reason an authorization cannot be used right now, else None.
+
+    Used for the last check immediately before a send, because an authorization
+    may be revoked between request preparation and the actual network call.
+    """
+    decision = _active(auth, now or utcnow())
+    return decision.code if decision is not None else None
 
 
 def scope_paths(value: object) -> list[str] | None:
@@ -212,7 +227,12 @@ def finish_attempt(
         error_code=error_code,
     )
     db.add(record)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发终结：另一个写入者已先落终态，唯一索引拒绝第二个。
+        db.rollback()
+        raise PermissionError("send attempt already finalized") from None
     db.refresh(record)
     return record
 

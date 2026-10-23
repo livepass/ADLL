@@ -117,6 +117,8 @@ def test_worker_real_transport_uses_body_file_bytes(monkeypatch, tmp_path) -> No
             "endpoint": "https://dashscope.aliyuncs.com/apps/anthropic/v1/messages",
             "payload": _payload(),
             "body_file": str(body_file),
+            # 发送前摘要复核：审计记录的 request_digest 必须与待发送字节一致。
+            "request_digest": hashlib.sha256(body).hexdigest(),
             "work_dir": str(tmp_path),
             "timeout": 30,
         }
