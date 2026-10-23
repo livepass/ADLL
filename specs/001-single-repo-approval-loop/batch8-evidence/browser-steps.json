@@ -1,0 +1,45 @@
+{
+  "testing_mode": {
+    "command": "backend/.venv/Scripts/python.exe scripts/browser_e2e.py --base-url http://127.0.0.1:5173 --repo <synthetic-repo> --password <temporary-test-password> --db backend/.browser-test/test.db --out-dir backend/.browser-test/screens2",
+    "steps": [
+      {"step": "login", "ok": true},
+      {"step": "link_repo", "ok": true, "detail": "3cfbfba6a9c8c8927b75351e116912e81ade5ddc"},
+      {"step": "create_task", "ok": true, "detail": "/tasks/1"},
+      {"step": "save_requirement", "ok": true},
+      {"step": "create_authorization", "ok": true},
+      {"step": "403_outbound_denied_feedback", "ok": true},
+      {"step": "423_baseline_unavailable_feedback", "ok": true},
+      {"step": "mock_generation", "ok": true},
+      {"step": "409_approval_exists_feedback", "ok": true},
+      {"step": "approve", "ok": true},
+      {"step": "reload_restores_state", "ok": true},
+      {"step": "requirement_change_invalidates_approval", "ok": true},
+      {"step": "revoke_authorization", "ok": true},
+      {"step": "401_redirects_to_login", "ok": true, "detail": "/login"}
+    ]
+  },
+  "production_503": {
+    "command": "backend/.venv/Scripts/python.exe scripts/browser_e2e.py --mode 503 --base-url http://127.0.0.1:5173 --repo <synthetic-repo> --password <temporary-test-password> --out-dir backend/.browser-test/screens3",
+    "steps": [
+      {"step": "login", "ok": true},
+      {"step": "link_repo", "ok": true},
+      {"step": "create_task", "ok": true},
+      {"step": "save_requirement", "ok": true},
+      {"step": "create_authorization", "ok": true},
+      {"step": "ui_blocks_real_generation", "ok": true},
+      {"step": "503_ai_disabled_feedback", "ok": true}
+    ]
+  },
+  "screenshots": [
+    "01-dashboard.png",
+    "02-task.png",
+    "03-403.png",
+    "04-423.png",
+    "05-409.png",
+    "06-approved.png",
+    "07-invalidated.png",
+    "10-production-disabled.png",
+    "11-503.png"
+  ],
+  "note": "Production 503 used temporary DOM disabled removal to exercise the real HTTP 503 path; default UI blocks the button (fail-closed)."
+}

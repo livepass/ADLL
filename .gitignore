@@ -1,0 +1,35 @@
+# --- Python ---
+backend/.venv/
+__pycache__/
+*.py[cod]
+backend/requirements-report.json
+
+# --- Node ---
+frontend/node_modules/
+frontend/dist/
+
+# --- 环境与密钥（仅示例文件纳入版本管理）---
+.env
+*.env
+!*.env.example
+
+# --- 本地临时/缓存 ---
+.claude/tmp/
+*.log
+.pytest_cache/
+.ruff_cache/
+*.tsbuildinfo
+
+# --- 隔离测试沙箱与临时构建 ---
+# adll-iso-* 内含 approval.db / credential.txt 测试金丝雀，不进入版本库
+backend/adll-iso-*/
+backend/.tmp-*/
+backend/staging-*/
+
+# --- Windows 保留设备名，git 无法正确读写 ---
+backend/nul
+
+# --- 本地工具状态 ---
+.claude/
+.dsh_inspect/
+.workbuddy/

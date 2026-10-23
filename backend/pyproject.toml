@@ -1,0 +1,24 @@
+[project]
+name = "adll-backend"
+version = "0.1.0"
+description = "ADLL V1.1 backend — 单仓库任务与 AI 方案审批闭环"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.111,<1",
+  "uvicorn>=0.30,<1",
+  "pydantic>=2.6,<3",
+  "sqlalchemy>=2.0,<2.1",
+  "alembic>=1.13,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "httpx>=0.27,<1",
+  "ruff>=0.4,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
