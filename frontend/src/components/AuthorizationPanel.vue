@@ -70,22 +70,7 @@
           撤销
         </button>
         <div v-if="previewFor === auth.id && previewData" class="preview-block">
-          <p class="muted">
-            receiver={{ previewData.receiver }} · data_types={{ previewData.data_types.join(', ') }}
-          </p>
-          <p class="muted">request_digest={{ previewData.request_digest }}</p>
-          <p class="muted">snapshot_digest={{ previewData.snapshot.digest }}</p>
-          <p class="muted">
-            需求：{{ previewData.requirement.chars }} 字符 · sha256={{ previewData.requirement.sha256 }}
-          </p>
-          <ul>
-            <li v-for="item in previewData.source" :key="item.path">
-              {{ item.path }} · {{ item.bytes }} B · {{ item.sha256 }}
-            </li>
-          </ul>
-          <p class="muted" v-if="previewData.snapshot.excluded.length">
-            排除：{{ previewData.snapshot.excluded.map((e) => `${e.path}(${e.reason})`).join(', ') }}
-          </p>
+          <OutboundPreview :preview="previewData" />
         </div>
       </li>
       <li v-if="authorizations.length === 0" class="muted">暂无授权。</li>
@@ -97,6 +82,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { api, type Authorization, type PreviewResponse } from '../api'
 import { describeError } from '../api/errors'
+import OutboundPreview from './OutboundPreview.vue'
 
 const props = defineProps<{
   taskId: number

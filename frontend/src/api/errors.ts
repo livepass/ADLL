@@ -27,6 +27,14 @@ const MESSAGES: Record<string, string> = {
   validation_error: '请求参数校验失败。',
   invalid_decision: '工作区决定无效。',
   invalid_receiver: '接收方必填。',
+  preview_required: '必须先预览待发送内容并确认后才能发送。',
+  preview_digest_mismatch: '待发送内容已变化（与预览不一致），请重新预览并确认。',
+  scope_required: '未指定发送范围；空范围不会授权任何源码。',
+  invalid_scope: '发送范围格式不正确（需要 paths 列表）。',
+  scope_unverifiable: '发送范围无法核验，已拒绝（fail-closed）。',
+  source_scope_required: '授权发送源码时必须给出至少一个路径。',
+  invalid_data_types: '数据类型不在允许范围内。',
+  audit_unavailable: '发送审计无法写入，已阻止发送（零发送）。',
   error: '请求失败。',
 }
 

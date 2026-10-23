@@ -236,24 +236,26 @@ def _run_body(
         db.commit()
         return None, None
 
-    execution.status = "completed"
-    execution.usage = result.usage
-    execution.usage_basis = result.usage_basis
-    execution.cost = result.cost
-    execution.finished_at = utcnow()
-    db.commit()
+    # 核验是「完成」的必要条件。先计算核验（纯函数，不写库），再把核验记录、
+    # 方案版本与执行终态放进**同一个提交**：读侧永远不会看到 completed 而核验缺失。
+    try:
+        outcome = verification.verify(
+            prepared=prepared,
+            source_items=source_items,
+            snapshot_digest=snapshot_digest,
+            snapshot_manifest=snapshot_manifest,
+            isolation=isolation,
+            send_phase=send_phase,
+            result_text=result.text,
+            result_evidence=dict(getattr(result, "send_evidence", {}) or {}),
+            testing=testing,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 核验本身失败：请求可能已发出（已记 confirmed_sent），但不得留下 completed。
+        db.rollback()
+        _finish(db, execution, "failed", f"verification_error:{type(exc).__name__}")
+        return None, None
 
-    outcome = verification.verify(
-        prepared=prepared,
-        source_items=source_items,
-        snapshot_digest=snapshot_digest,
-        snapshot_manifest=snapshot_manifest,
-        isolation=isolation,
-        send_phase=send_phase,
-        result_text=result.text,
-        result_evidence=dict(getattr(result, "send_evidence", {}) or {}),
-        testing=testing,
-    )
     attempt_no = (
         db.query(VerificationAttempt).filter_by(execution_id=execution.id).count() + 1
     )
@@ -266,8 +268,6 @@ def _run_body(
         coverage_note=outcome.coverage_note,
     )
     db.add(record)
-    db.commit()
-    db.refresh(record)
 
     proposal = None
     if outcome.status == "verified" and outcome.sufficient:
@@ -288,7 +288,21 @@ def _run_body(
             content_hash=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
         )
         db.add(proposal)
+
+    execution.status = "completed"
+    execution.usage = result.usage
+    execution.usage_basis = result.usage_basis
+    execution.cost = result.cost
+    execution.finished_at = utcnow()
+    try:
         db.commit()
+    except Exception as exc:  # noqa: BLE001
+        # 原子提交失败 → 全部回滚，执行保持 running 后立即转 failed，而不是 completed。
+        db.rollback()
+        _finish(db, execution, "failed", f"verification_persist_error:{type(exc).__name__}")
+        return None, None
+    db.refresh(record)
+    if proposal is not None:
         db.refresh(proposal)
     return record, proposal
 
@@ -526,8 +540,68 @@ def request_cancel(db, execution_id: int) -> str | None:
     return "cancel_requested"
 
 
+def reconcile_orphan_attempts(db) -> int:
+    """重启恢复：只有 `prepared`、没有终态的发送尝试 → 保守标记 `possibly_sent`。
+
+    本地无法证明请求是否写出网络，因此既不能补 `confirmed_sent`，也不能补
+    `not_sent`。追加一行 `possibly_sent`（error_code=restart_unconfirmed），
+    保持 append-only：不改写原 `prepared` 行，也不重复终结已有终态的尝试。
+    """
+    from sqlalchemy import or_, select
+
+    from ..models.outbound import SendAuditRecord
+
+    finalized = select(SendAuditRecord.attempt_id).where(
+        SendAuditRecord.phase != "prepared"
+    )
+    orphans = (
+        db.query(SendAuditRecord)
+        .filter(
+            SendAuditRecord.phase == "prepared",
+            or_(
+                SendAuditRecord.attempt_id.is_(None),
+                ~SendAuditRecord.attempt_id.in_(finalized),
+            ),
+        )
+        .order_by(SendAuditRecord.id)
+        .all()
+    )
+    reconciled = 0
+    for row in orphans:
+        if row.execution_id is not None:
+            try:
+                execution = db.get(GenerationExecution, int(row.execution_id))
+            except (TypeError, ValueError):
+                execution = None
+            if execution is not None and execution.status == "running":
+                # 仍由本进程的工作线程负责写终态，不在恢复阶段截断。
+                continue
+        db.add(
+            SendAuditRecord(
+                authorization_id=row.authorization_id,
+                execution_id=row.execution_id,
+                attempt_id=row.attempt_id,
+                phase="possibly_sent",
+                receiver=row.receiver,
+                payload_manifest=row.payload_manifest,
+                content_digest=row.content_digest,
+                payload_digest=row.payload_digest,
+                request_digest=row.request_digest,
+                error_code="restart_unconfirmed",
+            )
+        )
+        reconciled += 1
+    if reconciled:
+        db.commit()
+    return reconciled
+
+
 def reconcile_after_restart(db) -> int:
-    """重启恢复：遗留 running → failed（restart_incomplete），不判 verified。"""
+    """重启恢复：遗留 running → failed（restart_incomplete），不判 verified。
+
+    同时把重启后只剩 `prepared` 的发送尝试补记 `possibly_sent`，避免审计里出现
+    “已准备但永不终结”的悬空尝试。
+    """
     running = db.query(GenerationExecution).filter_by(status="running").all()
     for execution in running:
         execution.status = "failed"
@@ -535,4 +609,5 @@ def reconcile_after_restart(db) -> int:
         execution.finished_at = utcnow()
     if running:
         db.commit()
+    reconcile_orphan_attempts(db)
     return len(running)

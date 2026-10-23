@@ -141,6 +141,8 @@ export interface GenerationDetail {
   execution: Execution
   verification: Verification | null
   proposal: Proposal | null
+  /** completed 但缺少核验记录（历史异常数据）：成功状态不可信。 */
+  verification_missing?: boolean
 }
 
 export interface SnapshotSummary {
@@ -159,13 +161,29 @@ export interface OutboundReceiver {
   testing: boolean
 }
 
+export interface PreviewTextPart {
+  sha256: string
+  chars: number
+  bytes: number
+  /** 实际发送的原文（逐字确认用），不是哈希占位。 */
+  content: string
+}
+
+export interface PreviewSourcePart extends PreviewTextPart {
+  path: string
+}
+
 export interface PreviewResponse {
   receiver: string
+  model: string
+  testing: boolean
   data_types: string[]
   request_digest: string
-  requirement: { sha256: string; chars: number }
-  feedback: { sha256: string; chars: number }[]
-  source: { path: string; sha256: string; bytes: number }[]
+  /** 最终写入 HTTP 请求体的同一条 message。 */
+  message: { content: string; sha256: string; bytes: number }
+  requirement: PreviewTextPart
+  feedback: PreviewTextPart[]
+  source: PreviewSourcePart[]
   snapshot: {
     digest: string
     files: string[]

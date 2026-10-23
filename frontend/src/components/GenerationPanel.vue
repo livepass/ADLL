@@ -6,9 +6,22 @@
       离线测试：本页生成的方案由 Mock 合成，不会发送源码、不调用任何外部 AI。
     </p>
 
+    <p class="muted">
+      发送分两步：先「预览待发送内容」核对接收方／模型／正文／文件与请求摘要，
+      再单独点击「确认发送」。只预览不会发出任何请求。
+    </p>
+
     <div class="row">
-      <button type="button" :disabled="startDisabled" @click="start">
-        {{ runtime.testing ? '离线合成生成（Mock）' : '发起真实生成' }}
+      <button
+        type="button"
+        data-test="preview"
+        :disabled="previewBusy || previewDisabled"
+        @click="loadPreview"
+      >
+        {{ previewBusy ? '生成预览中…' : '① 预览待发送内容' }}
+      </button>
+      <button type="button" data-test="send" :disabled="sendDisabled" @click="send">
+        {{ starting ? '发送中…' : runtime.testing ? '② 确认生成（Mock 合成）' : '② 确认并发送' }}
       </button>
       <button
         v-if="isRunning"
@@ -21,12 +34,21 @@
       </button>
       <span v-if="isRunning" class="muted">轮询状态（1s）；无伪造 SSE 进度。</span>
     </div>
-    <p v-if="startDisabledReason" class="muted">{{ startDisabledReason }}</p>
+
+    <p v-if="previewDirty" class="warning" role="status">
+      待发送内容已变化（反馈／任务／授权／快照），原预览确认已失效，请重新预览后再确认。
+    </p>
+    <p v-else-if="previewFresh" class="notice" role="status">
+      预览已核对：下面的接收方、模型、正文与文件即为实际发送内容。点击「确认」才会发起。
+    </p>
+    <p v-if="previewDisabledReason" class="muted">{{ previewDisabledReason }}</p>
 
     <label class="stack-tight">
       随本次生成的反馈（可选，逐条作为 feedback 数据类型发送）
-      <textarea v-model="feedbackText" rows="2" :disabled="starting"></textarea>
+      <textarea v-model="feedbackText" data-test="feedback" rows="2" :disabled="starting"></textarea>
     </label>
+
+    <OutboundPreview v-if="preview" :preview="preview" />
 
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="notice" class="notice">{{ notice }}</p>
@@ -47,6 +69,10 @@
         <dt>失败原因</dt>
         <dd>{{ failureLabel }}</dd>
       </dl>
+
+      <p v-if="detail.verification_missing" class="error" role="alert">
+        completed 但缺少核验记录：该成功状态不可信，不能据此提交审批。
+      </p>
 
       <UsageCost :execution="detail.execution" />
 
@@ -122,8 +148,11 @@ import {
   type SnapshotSummary,
   type Verification,
 } from '../api'
+import { ApiError } from '../api/client'
 import { describeError } from '../api/errors'
+import { feedbackLines, usePreviewGate } from '../state/previewGate'
 import { runtime } from '../state/session'
+import OutboundPreview from './OutboundPreview.vue'
 import UsageCost from './UsageCost.vue'
 
 const props = defineProps<{
@@ -145,6 +174,7 @@ const error = ref('')
 const notice = ref('')
 const feedbackText = ref('')
 const starting = ref(false)
+const previewBusy = ref(false)
 const cancelling = ref(false)
 const auditBusy = ref(false)
 const audits = ref<SendAudit[]>([])
@@ -154,19 +184,37 @@ const activeAuthorization = computed(() => {
   return props.authorizations.find((auth) => auth.status === 'approved') || null
 })
 
+const gate = usePreviewGate(() => ({
+  taskId: props.taskId,
+  authorizationId: activeAuthorization.value?.id ?? -1,
+  feedback: feedbackLines(feedbackText.value),
+}))
+// 顶层 ref 才能在模板里自动解包。
+const preview = gate.preview
+const previewFresh = gate.fresh
+const previewDirty = gate.dirty
+
 const isRunning = computed(() => {
   const status = detail.value?.execution.status
   return !!status && !TERMINAL.has(status)
 })
 
-const startDisabled = computed(() => startDisabledReason.value !== '')
-const startDisabledReason = computed(() => {
+const previewDisabledReason = computed(() => {
   if (!props.requirementContent) return '尚无正式需求版本；先保存需求。'
   if (isRunning.value) return '已有运行中的生成；结束后可重试（重试使用新的执行标识）。'
   if (!activeAuthorization.value) return '没有有效的出站授权；请先创建授权（撤销/过期均不可用）。'
-  if (runtime.testing) return ''
-  if (!runtime.realAiEnabled) return '真实 AI 未启用（fail-closed）；生产模式默认禁止真实发送。'
+  if (!runtime.testing && !runtime.realAiEnabled) {
+    return '真实 AI 未启用（fail-closed）；生产模式默认禁止真实发送。'
+  }
   return ''
+})
+
+const previewDisabled = computed(() => previewDisabledReason.value !== '')
+const sendDisabled = computed(() => {
+  if (starting.value || previewBusy.value || isRunning.value) return true
+  if (previewDisabledReason.value !== '') return true
+  // 关键：没有「与当前内容一致」的预览时禁止发送，避免自动取 digest 代替人工确认。
+  return !previewFresh.value
 })
 
 const statusClass = computed(() => {
@@ -240,28 +288,52 @@ async function load(executionId: number, announce = true): Promise<void> {
   }
 }
 
-async function start(): Promise<void> {
+async function loadPreview(): Promise<void> {
+  const auth = activeAuthorization.value
+  if (!auth) return
+  previewBusy.value = true
+  error.value = ''
+  notice.value = ''
+  audits.value = []
+  try {
+    const result = await api.previewGeneration(
+      props.taskId,
+      auth.id,
+      feedbackLines(feedbackText.value),
+    )
+    gate.load(result)
+    notice.value = '预览已生成。请核对接收方、模型、正文与文件后再点击「确认」。'
+  } catch (err) {
+    gate.reset()
+    error.value = describeError(err)
+  } finally {
+    previewBusy.value = false
+  }
+}
+
+async function send(): Promise<void> {
+  if (!previewFresh.value) {
+    error.value = '请先预览待发送内容，再确认发送。'
+    return
+  }
   const auth = activeAuthorization.value
   if (!auth) return
   starting.value = true
   error.value = ''
   notice.value = ''
-  audits.value = []
   try {
-    const feedback = feedbackText.value.split('\n').map((line) => line.trim()).filter(Boolean)
-    // 先取预览摘要并在请求中回传：真实发送必须与用户看到的范围/内容一致。
-    const preview = await api.previewGeneration(props.taskId, auth.id, feedback)
-    const result = await api.startGeneration(
-      props.taskId,
-      auth.id,
-      feedback,
-      preview.request_digest,
-    )
+    const { digest, feedback } = gate.consume()
+    const result = await api.startGeneration(props.taskId, auth.id, feedback, digest)
+    gate.reset()
     snapshot.value = result.snapshot
     detail.value = null
     emit('executionSelected', result.execution_id)
     await load(result.execution_id)
   } catch (err) {
+    if (err instanceof ApiError && err.code === 'preview_digest_mismatch') {
+      // 服务端发现内容已变化：旧确认作废，必须重新预览。
+      gate.reset()
+    }
     error.value = describeError(err)
   } finally {
     starting.value = false

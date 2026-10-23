@@ -1,6 +1,8 @@
 """出站授权 API：创建/查询/撤销 + 撤销后零发送。"""
 from __future__ import annotations
 
+import hashlib
+
 from tests.helpers import csrf_headers, login_client, make_repo
 
 
@@ -144,10 +146,47 @@ def test_preview_shows_scope_and_digests_without_sending(tmp_path, app_factory) 
     assert preview.status_code == 200, preview.text
     body = preview.json()
     assert body["receiver"] == "mock://local"
+    assert body["testing"] is True  # 合成标识：Mock 模式不冒充真实服务商
+    assert body["model"]
     assert [item["path"] for item in body["source"]] == ["a.txt"]
     assert len(body["request_digest"]) == 64
     assert len(body["snapshot"]["digest"]) == 64
     assert len(body["requirement"]["sha256"]) == 64
+    # 逐字确认：必须返回真实内容，而不是只给哈希。
+    repo_file = (_repo / "a.txt").read_text(encoding="utf-8")
+    assert body["source"][0]["content"] == repo_file
+    assert body["requirement"]["content"] == "需求"
+    assert body["message"]["content"].startswith("## Requirement")
+    assert repo_file in body["message"]["content"]
+    assert (
+        hashlib.sha256(body["message"]["content"].encode("utf-8")).hexdigest()
+        == body["message"]["sha256"]
+    )
+
+
+def test_preview_digest_changes_when_feedback_changes(tmp_path, app_factory) -> None:
+    """预览后修改反馈：摘要必须变化，旧确认随之失效。"""
+    _app, client, csrf, task, _repo = _setup(tmp_path, app_factory)
+    auth = client.post(
+        f"/api/tasks/{task['id']}/outbound-authorizations",
+        json={"receiver": "mock://local", "send_scope": {"paths": ["a.txt"]}},
+        headers=csrf_headers(csrf, "auth-preview-2"),
+    ).json()["authorization"]
+
+    def preview(feedback: list[str]) -> dict:
+        resp = client.post(
+            f"/api/tasks/{task['id']}/generations/preview",
+            json={"authorization_id": auth["id"], "feedback": feedback},
+            headers=csrf_headers(csrf, "preview-fb"),
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    first = preview([])
+    second = preview(["补充说明"])
+    assert first["request_digest"] != second["request_digest"]
+    assert second["feedback"][0]["content"] == "补充说明"
+    assert "补充说明" in second["message"]["content"]
 
 
 def test_outbound_receiver_endpoint(tmp_path, app_factory) -> None:

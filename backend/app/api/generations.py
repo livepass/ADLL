@@ -209,21 +209,43 @@ def preview_generation(
         http_error(423 if exc.code == "baseline_unavailable" else 409, exc.code, exc.code)
     except OutboundDenied as exc:
         http_error(403, "outbound_denied", exc.code)
+    settings = request.app.state.settings
+    wire_text = prepared.payload["messages"][0]["content"]
     return {
         "receiver": prepared.receiver,
+        "model": settings.dashscope_model,
+        "testing": settings.testing,
         "data_types": prepared.data_types,
         "request_digest": prepared.request_digest,
+        # 逐字确认：这是最终写入 HTTP 请求体的同一条 message。
+        "message": {
+            "content": wire_text,
+            "sha256": __import__("hashlib").sha256(wire_text.encode("utf-8")).hexdigest(),
+            "bytes": len(wire_text.encode("utf-8")),
+        },
         "requirement": {
             "sha256": __import__("hashlib").sha256(requirement.content.encode("utf-8")).hexdigest(),
             "chars": len(requirement.content),
+            "bytes": len(requirement.content.encode("utf-8")),
+            "content": requirement.content,
         },
         "feedback": [
-            {"sha256": __import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
-             "chars": len(text)}
+            {
+                "sha256": __import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
+                "chars": len(text),
+                "bytes": len(text.encode("utf-8")),
+                "content": text,
+            }
             for text in body.feedback
         ],
         "source": [
-            {"path": item["path"], "sha256": item["sha256"], "bytes": len(item["content"].encode("utf-8"))}
+            {
+                "path": item["path"],
+                "sha256": item["sha256"],
+                "chars": len(item["content"]),
+                "bytes": len(item["content"].encode("utf-8")),
+                "content": item["content"],
+            }
             for item in items
         ],
         "snapshot": {
@@ -252,8 +274,13 @@ def get_generation(
         .first()
     )
     proposal = db.query(ProposalVersion).filter_by(execution_id=execution_id).first()
+    # 正常情况下 completed 与核验记录在同一事务提交，不可能只看到前者。
+    # 历史数据（本修复前的写入）可能有 completed 无核验：终态受数据库触发器保护，
+    # 不能改写，因此在这里显式标记，避免把“无核验的成功”当成可信结果。
+    verification_missing = execution.status == "completed" and verification is None
     return {
         "execution": _execution_dict(execution),
+        "verification_missing": verification_missing,
         "verification": (
             {
                 "id": verification.id,
