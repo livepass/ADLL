@@ -1,5 +1,7 @@
 # S9 真实发送门禁与 OS 隔离方案收口
 
+> 当前效力：本文为历史记录，不可作为当前部署或真实发送许可。S9 架构与验收以 [执行身份与网络隔离架构裁定](s9-isolation-architecture-decision.md) 为准。旧 block_all + allow_dashscope 组合已裁定 NO-GO；部署位置待定，生产发送仍关闭。
+
 **日期**：2026-10-23　**基线**：GitHub main `2df5fcc`（= 本机 HEAD）
 **边界**：未 Commit/Push、未调用真实百炼、未读 Key、未改 ACL/防火墙、未创建账户/VM/容器、
 未访问真实业务仓库、未修改 ADLL-Knowledge。
