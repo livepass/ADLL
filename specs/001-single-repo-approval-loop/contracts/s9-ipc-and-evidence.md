@@ -1,6 +1,6 @@
 # S9 IPC 与安全证据接口契约草案
 
-**日期**：2026-10-24（R2 定向修订）　**状态**：DRAFT（待审批；不改已批准 contracts/agent-adapter.md）
+**日期**：2026-10-24（R2 定向修订；R3 补三项收口 §2.1 / §5.1 / §6.1）　**状态**：DRAFT（待审批；不改已批准 contracts/agent-adapter.md）
 **上位**：[s9-detailed-plan.md](./s9-detailed-plan.md)、[s9-isolation-architecture-decision.md](./s9-isolation-architecture-decision.md)
 
 本契约定义「FastAPI 宿主 ↔ 受保护启动器/Worker VM ↔ 固定出口」之间的最小接口与
@@ -37,6 +37,39 @@ AuthorizationRequest {
 约束：
 - `request_digest` 由 Launcher 在发送前对最终字节重算，必须与 `body_ref` 及审计行一致；
 - 不允许同时篡改 body 与 job 摘要通过。
+
+### 2.1 Launcher 无权读审批 DB：经认证、完整性保护的宿主授权收据确认绑定
+
+Launcher 运行在 Worker VM 内，**无权读取宿主审批数据库**（无 DB 连接、无审批服务
+身份、无法查询 `SendAuditRecord` 或 `OutboundAuthorization`）。因此 Launcher 不能自行
+核验「prepared 行存在且与本次请求绑定」，也不能**只相信调用方在
+`AuthorizationRequest` 里填写的 `request_digest`/`authorization_id`/`attempt_id`**。
+
+宿主在 `AuthorizationRequest` 之外，随请求下发一条**宿主签名授权收据**
+（`HostAuthorizationReceipt`，由宿主签名，签名体含以下字段）：
+
+| 字段 | 说明 |
+|---|---|
+| `attempt_id` | 与 `SendAuditRecord.attempt_id` 一致 |
+| `authorization_id` | 已批准授权记录 id |
+| `receiver` | 固定上游端点（宿主从授权记录读取） |
+| `request_digest` | 宿主对**不可变请求体**算得的 SHA-256 |
+| `authorization_status` | 宿主下发时该授权确为 `APPROVED` 且未撤销/未过期 |
+| `policy_version` | 宿主认可的出站策略版本 |
+| `issued_at` / `expires_at` | 收据有效期（短暂） |
+| `signature` / `key_id` | 宿主签名与密钥标识 |
+
+约束（强制）：
+
+- Launcher 只接受**宿主签名、未过期**的 `HostAuthorizationReceipt`；验签失败、过期、
+  字段与 `AuthorizationRequest` 不一致 → 拒绝，不启动 Worker。
+- Launcher **不得**仅凭 `AuthorizationRequest` 里调用方填写的 `request_digest` 放行；
+  它必须以收据中的 `request_digest` 为基准，对实际推送字节重算并比对（§7）。
+- 该收据**不替代**宿主侧 `SendAuditRecord` 唯一终态与审计绑定；它只解决「远端无法
+  查库、如何可信确认 prepared 绑定」的问题，是宿主授权的**完整性保护凭证**，而非
+  Worker/Launcher 的发送授权来源。
+- 收据经认证通道下发（与 §1 的宿主↔Launcher 互认同一通道），不通过可被 Worker 篡改
+  的 job 文件或环境变量传递。
 
 ## 3. body_ref：跨 VM 字节传输方式与大小限制
 
@@ -93,6 +126,44 @@ SendReceipt {
 - **审计绑定**：收据的 `attempt_id` 必须命中已持久化的 prepared 行；收据写入即生成
   唯一终态行（既有 0008 部分唯一索引兜底）。过期/签名不符的收据不落终态。
 
+### 5.1 签名收据必须绑定实际请求（不信任调用方填写的 request_digest）
+
+固定出口的签名收据不得只是一句「已转发某 attempt」——它必须由出口**对其真实转发
+的字节**与请求上下文一并签名，使收据可被宿主独立复核到「这一次实际请求」。
+
+`SendReceipt` 的**签名覆盖内容（规范化后签名）**至少包含以下字段（任一缺失或对不上
+即视为签名不符、不落终态）：
+
+| 字段 | 来源 | 说明 |
+|---|---|---|
+| `attempt_id` | 宿主 → Launcher → Egress | 随机 UUID，与 prepared 行一致 |
+| `authorization_id` | 宿主 → Launcher → Egress | 与 prepared 行一致 |
+| `receiver` | 宿主（固定上游端点） | 出口实际连接的上游端点，必须等于 prepared 行 |
+| `request_digest` | 宿主对不可变请求体算得 | prepared 行已持久化的 SHA-256 |
+| `actual_body_sha256` | Egress 对**实际转发字节**重算 | 出口真实收到的请求体摘要；宿主据此与 `request_digest` 比对 |
+| `policy_version` | Egress | 出口生效的转发/校验策略版本 |
+| `issuer` | 常量 `"egress"` | 签发者身份 |
+| `key_id` | Egress | 本次签名所用密钥标识（支持轮换） |
+
+规范化与签名方式：
+
+- 上述字段按**固定键名排序**拼接为规范化字节串（`canonical_payload_bytes` 同源
+  算法，UTF-8、`ensure_ascii=False`、`sort_keys=True`），再以 Egress 私钥签名；
+  `key_id` 一并进入签名体，宿主用对应公钥验签。
+- `actual_body_sha256` 是出口对**实际接收字节**独立重算的摘要，不是回显宿主传入的
+  `request_digest`；出口禁止把调用方/宿主传来的 `request_digest` 原样写回收据充当
+  `actual_body_sha256`。
+
+宿主验证方式（收到收据后）：
+
+1. 用 `key_id` 取公钥，验签；验签失败 → 不落终态，记安全事件。
+2. 校验 `attempt_id` 命中已持久化的 prepared 行，且 `authorization_id`、`receiver`
+   与该行一致；不一致 → 拒绝（视为跨任务替换）。
+3. 比对 `actual_body_sha256 == prepared.request_digest`；不等 → 拒绝（字节被改写）。
+4. 校验 `issued_at`/`expires_at` 未过期、`policy_version` 受宿主认可。
+5. 全部通过才把收据作为本次 attempt 的唯一终态落库；任一失败按 §6 处理，不得生成
+   `verified` 方案。
+
 ## 6. 重启 / 超时 / 重复请求 / 发送状态未知
 
 | 情形 | 处理 |
@@ -102,6 +173,30 @@ SendReceipt {
 | 超时 | `possibly_sent`（请求可能已写出）；不凭超时判 confirmed |
 | 重复 `attempt_id`/`nonce` | 直接拒绝，返回明确错误 |
 | 发送状态未知 | `possibly_sent`，绝不升格 confirmed_sent / 降格 not_sent |
+
+### 6.1 宿主重启后收到迟到收据（追加证据，不改写历史、不自动 verified）
+
+宿主重启后，`reconcile_orphan_attempts` 可能已把该 attempt 保守补记为
+`possibly_sent`。此时若又收到一条**有效迟到收据**，处理规则如下：
+
+1. **不违反 0008 唯一终态约束**：迟到收据**不得**再写入一条 `confirmed_sent`/`not_sent`
+   终态行（那样会与既有的 `possibly_sent` 终态冲突，触发部分唯一索引）。迟到收据
+   只能以**追加证据**方式保留。
+2. **不改写历史 SendAuditRecord**：既有 `prepared` 行与 `possibly_sent` 终态行一律
+   保持原样（append-only，数据库触发器 + 应用层均不改写）。
+3. **有效迟到收据以追加证据保留**：为迟到收据新增一条**非终态**的证据行（phase 保持
+   非终态语义，或以独立 `receipt_evidence` 结构挂到 `attempt_id`），记录其完整
+   签名、`actual_body_sha256`、`policy_version`、`key_id`、`issued_at`/`expires_at`、
+   验签结果。该证据行不计入唯一终态，因此不触碰 0008 约束。
+4. **不因收据到达自动生成 verified 方案**：迟到收据只补审计完整性，**不**触发新的
+   核验/`verified`/`ProposalVersion` 生成。已因重启判 `failed`/`possibly_sent` 的执行
+   终态不回退、不重开。
+5. **超时、重放、未知状态保持 fail-closed**：
+   - 迟到收据过期（`expires_at` 已过）→ 拒绝，不落任何证据；
+   - 签名不符 / `actual_body_sha256` 对不上 → 拒绝，记安全事件；
+   - `attempt_id` 重复 / 已有终态 → 只按「已终结」拒绝，不改写、不追加第二次终态；
+   - 收到收据但无法确证其与 prepared 行一致 → 保持 `possibly_sent`，绝不升格
+     `confirmed_sent`。
 
 ## 7. 固定请求体 vs 实际发送字节 SHA-256 对账
 
