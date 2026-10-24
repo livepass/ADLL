@@ -23,25 +23,27 @@
 
 - 传输：仅回环专用通道或专用网段（依部署位置），**不暴露到宿主默认网络**。
 - 认证：调用者（FastAPI）与 launcher 互相认证（证书或共享密钥），
-  消息签名防篡改，`attempt_id` 单调且全局唯一防重放。
+  消息签名防篡改；`attempt_id` 为随机 UUID（全局唯一、一次性），`nonce` 为随机一次性，
+  二者只用于防重放；**不把单调递增序号当作防重放凭据**（详见契约 §4）。
 - 消息结构（示意，最终入 contracts）：
 
 ```text
 AuthorizationRequest {
-  attempt_id: string        # 与 SendAuditRecord.attempt_id 一一绑定
+  attempt_id: string        # = SendAuditRecord.attempt_id（随机 UUID，全局唯一，一次性）
   authorization_id: int
   receiver: string          # 固定上游端点
   request_digest: string    # 不可变请求体的 SHA-256，与审计行一致
-  body_ref: handle/ref      # 不可变请求体（只读，不重编码）
+  body_ref: BodyRef         # 内容寻址（sha256）+ 字节推送；跨 VM 无共享句柄
   model: string
   timeout_ms: int
-  nonce: string             # 重放保护
+  nonce: string             # 随机一次性，仅防重放
+  policy_version: string
 }
 ```
 
 - 完整性：`request_digest` 由 launcher 在发送前对字节重算，必须与持久化
   审计行一致；不允许同时篡改 body 与 job 摘要通过。
-- 重放保护：`attempt_id` 全局唯一 + 一次性收据；重复 `attempt_id` 直接拒绝。
+- 重放保护：`attempt_id` 全局唯一 + 一次性收据；重复 `attempt_id`/`nonce` 直接拒绝。
 
 ## 3. 独立 TokenUser、受限令牌、挂起创建、Job 纳管、异常回收
 
@@ -86,19 +88,78 @@ AuthorizationRequest {
   可信解析器仅解析批准域名）、回环、代理、UDP、子进程、系统服务代发。
 - 禁宿主目录/驱动器共享、剪贴板旁路；宿主默认出站策略不变。
 
-## 7. 凭据存储 / 注入 / 轮换 / 清理 / 脱敏
+## 7. 固定出口与服务商凭据归属
 
-- 专用账户密码存系统受保护凭据存储，仅 launcher 可读；不写环境/参数/job/日志。
-- API Key 仅注入 Worker 环境，永不进聊天/日志/DB/evidence；调用后清除。
-- 轮换：密码与 Key 分别轮换，轮换后旧证据失效（策略/身份版本递增）。
+### 7.1 透明转发 vs 应用层受控出口（比较与裁定）
+
+| 维度 | 透明转发（TLS 隧道透传） | 应用层受控出口（推荐） |
+|---|---|---|
+| HTTP 方法/路径/正文校验 | 不解析，无法校验 Messages 语义 | 解析并校验仅 `POST …/v1/messages`，正文为已审核 JSON |
+| TLS 终止与重新加密 | 端到端透传，出口看不到明文 | 出口终止 TLS（校验上游证书），对上游重新加密；出口能看到明文以做摘要复核 |
+| API Key 位置 | 端到端直达上游，Key 只在 Worker/上游 | **出口持有 Key**，注入 `Authorization: Bearer` 后转发；Worker 不持 Key |
+| 日志脱敏 | 出口不落明文，风险低 | 出口必须对 Key/Authorization 头/正文脱敏，只记摘要与状态 |
+| 失败回执 | 无应用层回执，只能靠连接失败 | 可返回结构化收据（http_status/provider_request_id/原始响应摘要） |
+| 可实施性 | 需通用 TLS 隧道，边界更难收紧 | 仅固定端点，符合已批准 S9「固定出口 + 摘要复核 + 收据」 |
+
+**裁定：应用层受控出口**。理由：它能满足已批准 S9 的「固定 Messages POST 校验、
+不可变字节摘要复核、原始响应字节摘要、结构化收据」；透明转发做不到这些。
+
+### 7.2 凭据归属（推荐方案）
+
+- **API Key 归属固定出口**，不再由 Worker 持有或注入 Worker 环境；
+  出口仅对批准上游端点注入 `Authorization: Bearer`，Worker 只发送无凭据请求体。
+- 专用账户密码：系统受保护凭据存储，仅 Launcher 可读；不写环境/参数/job/日志。
+- 日志脱敏：出口与宿主对 Key/Authorization 头/请求正文/响应正文一律脱敏，
+  只记 SHA-256 与状态码；canary 测试覆盖。
+
+### 7.3 与现有凭据契约的差异（需人工批准的变更）
+
+现 `contracts/agent-adapter.md` §1「凭据仅环境变量注入 Agent 进程」与
+`worker_main._real_call` 的「Worker 从 `DASHSCOPE_API_KEY` 环境变量取 Key」语义，
+在本方案下变更为「Key 由固定出口持有，Worker 不再接触 Key」。这是对既有凭据契约的
+**实质变更**，须人工批准后才能编码；本草案仅记录差异，不擅自修改已批准契约。
+
+### 7.4 轮换 / 清理
+
+- 密码与 Key 分别轮换；轮换后旧策略/身份版本失效。
+- 出口凭据更新原子化；旧 Key 立即作废，不并行双 Key。
 
 ## 8. 发送前可信证据 vs 发送后实际结果（分别核验）
 
+### 8.1 跨 VM 证据来源划分（宿主 / Worker VM / 固定出口各提供什么）
+
+现有 `network_boundary.py` 只采集**宿主 Windows 防火墙规则**，不能证明远端 Guest
+隔离。修订后按来源拆分，各来源只提供其能可信证明的事实：
+
+| 证据来源 | 能提供 | 不能提供 |
+|---|---|---|
+| 宿主 FastAPI | prepared 审计行、attempt_id、request_digest、authorization_id、receiver | Worker 身份/网络/传输事实 |
+| Launcher（VM 内） | 主令牌 TokenUser、挂起创建、受限令牌、Job 归属、PID/创建时间/程序摘要、环境启动标识 | 网络出口事实、服务商响应 |
+| Egress relay | 出口策略版本、单次转发事实、HTTP 状态、原始响应字节摘要、服务商请求标识 | Worker 身份、目录隔离 |
+
+**关键**：Guest 的网络默认拒绝证据必须由 Guest 内（或出口侧）的可信采集器提供，
+不能由宿主防火墙规则推断；宿主只负责持久化与核验，不代填远端证据。
+
+### 8.2 可信证据收集接口
+
+统一证据记录（见 `contracts/s9-ipc-and-evidence.md` §8）：
+
+```text
+EvidenceRecord {
+  source: "host" | "launcher" | "egress"
+  subject_sid, environment_boot_id, policy_version,
+  collected_at, expires_at, signature, invalidation[], payload
+}
+```
+
+- 生产拒绝手填布尔值、synthetic 证据；
+- 失效条件：进程重建、策略版本变更、环境启动标识变化、有效期过期任一成立即失效。
+
 **发送前（全部成立才放行）**：实际 Worker TokenUser、PID+创建时间、环境启动标识、
-镜像/程序摘要、Job 归属；生效网络策略/Profile/路由/接口/IPv4/IPv6/出口覆盖证明；
-同身份/环境非授权目标拒绝观测（5157 PID/目标/Filter Runtime ID 关联）；prepared
-审计行已提交且 attempt/authorization/receiver/request_digest 单次收据一致；采集器
-身份/版本/时间/原始证据引用可复核。生产拒绝手填布尔值、synthetic 证据。
+镜像/程序摘要、Job 归属；Guest 生效网络策略/Profile/路由/接口/IPv4/IPv6/出口覆盖证明
+（来自 Guest/出口采集器，非宿主推断）；同身份/环境非授权目标拒绝观测（5157 PID/目标/
+Filter Runtime ID 关联）；prepared 审计行已提交且 attempt/authorization/receiver/
+request_digest 单次收据一致；采集器身份/版本/时间/原始证据引用可复核。
 
 **发送后**：真实传输回执、HTTP 状态、服务商请求标识、原始响应字节摘要、解析文本
 摘要、唯一终态、核验记录、隔离方案版本/策略摘要、满足验收时生成 ProposalVersion。
