@@ -48,6 +48,11 @@ SQLITE_GUARDS: tuple[str, ...] = (
     "BEGIN SELECT RAISE(ABORT,'send_receipt_evidence is append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS send_receipt_evidence_no_delete BEFORE DELETE ON send_receipt_evidence "
     "BEGIN SELECT RAISE(ABORT,'send_receipt_evidence is append-only'); END",
+    # 防重放登记一旦删改即可绕过单次处理，必须同样 append-only。
+    "CREATE TRIGGER IF NOT EXISTS s9_replay_no_update BEFORE UPDATE ON s9_replay_guard "
+    "BEGIN SELECT RAISE(ABORT,'s9_replay_guard is append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS s9_replay_no_delete BEFORE DELETE ON s9_replay_guard "
+    "BEGIN SELECT RAISE(ABORT,'s9_replay_guard is append-only'); END",
 )
 
 

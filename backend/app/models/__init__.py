@@ -17,6 +17,7 @@ from .late_result import LateResultRecord
 from .outbound import OutboundAuthorization, SendAuditRecord, SendReceiptEvidence
 from .proposal import ApprovalEvent, Feedback, ProposalVersion
 from .repository import AnalysisBaseline, GitRepository
+from .s9_replay import S9ReplayGuard
 from .session import UserSession
 from .task import RequirementVersion, Task
 
@@ -42,6 +43,7 @@ __all__ = [
     "ProposalVersion",
     "AnalysisBaseline",
     "GitRepository",
+    "S9ReplayGuard",
     "UserSession",
     "RequirementVersion",
     "Task",

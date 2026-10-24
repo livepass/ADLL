@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import uuid
@@ -47,6 +48,7 @@ def test_suspended_spawn_and_pre_resume_check_then_resume(iso_root) -> None:
             encoding="utf-8",
         )
         sandbox._allow_restricted_read(script)
+        script_sha = hashlib.sha256(script.read_bytes()).hexdigest()
         process = win32.spawn_restricted(
             [default_python(), "-I", str(script)],
             cwd=sandbox.work_dir,
@@ -63,6 +65,8 @@ def test_suspended_spawn_and_pre_resume_check_then_resume(iso_root) -> None:
                 process,
                 expected_token_user_sid=sandbox.parent_sid,
                 expected_restricting_sid=sandbox.restricting_sid,
+                expected_program_sha256=script_sha,
+                program_sha256=script_sha,
             )
             assert check.ok is True, check.fail_reasons
             assert check.pid == process.pid
@@ -83,6 +87,7 @@ def test_pre_resume_check_rejects_wrong_restricting_sid(iso_root) -> None:
         script = sandbox.work_dir / "sleep.py"
         script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
         sandbox._allow_restricted_read(script)
+        script_sha = hashlib.sha256(script.read_bytes()).hexdigest()
         process = win32.spawn_restricted(
             [default_python(), "-I", str(script)],
             cwd=sandbox.work_dir,
@@ -96,6 +101,8 @@ def test_pre_resume_check_rejects_wrong_restricting_sid(iso_root) -> None:
                 process,
                 expected_token_user_sid=sandbox.parent_sid,
                 expected_restricting_sid="S-1-5-21-9999999999-9999999999-9999999999-9999",
+                expected_program_sha256=script_sha,
+                program_sha256=script_sha,
             )
             assert check.ok is False
             assert "restricting_sid_mismatch" in check.fail_reasons
@@ -137,6 +144,7 @@ def test_pre_resume_check_rejects_wrong_token_user(iso_root) -> None:
         script = sandbox.work_dir / "sleep.py"
         script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
         sandbox._allow_restricted_read(script)
+        script_sha = hashlib.sha256(script.read_bytes()).hexdigest()
         process = win32.spawn_restricted(
             [default_python(), "-I", str(script)],
             cwd=sandbox.work_dir,
@@ -149,9 +157,73 @@ def test_pre_resume_check_rejects_wrong_token_user(iso_root) -> None:
                 process,
                 expected_token_user_sid="S-1-5-21-8888888888-8888888888-8888888888-8888",
                 expected_restricting_sid=sandbox.restricting_sid,
+                expected_program_sha256=script_sha,
+                program_sha256=script_sha,
             )
             assert check.ok is False
             assert "token_user_mismatch" in check.fail_reasons
+        finally:
+            process.job.terminate()
+            process.close()
+
+
+def test_pre_resume_check_fail_closed_when_expectations_missing(iso_root) -> None:
+    """确定性负向：缺少批准 SID / restricting SID / 程序身份 → fail-closed。
+
+    不允许「未配置即跳过核对」的分支：缺失本身必须使检查失败。
+    """
+    with Sandbox(_spec(iso_root)) as sandbox:
+        script = sandbox.work_dir / "sleep.py"
+        script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+        sandbox._allow_restricted_read(script)
+        process = win32.spawn_restricted(
+            [default_python(), "-I", str(script)],
+            cwd=sandbox.work_dir,
+            env=win32.build_environment(),
+            restricting_sid=sandbox.restricting_sid,
+            suspended=True,
+        )
+        try:
+            check = win32.pre_resume_check(
+                process,
+                expected_token_user_sid=None,
+                expected_restricting_sid=None,
+                expected_program_sha256=None,
+            )
+            assert check.ok is False
+            assert "expected_token_user_sid_missing" in check.fail_reasons
+            assert "expected_restricting_sid_missing" in check.fail_reasons
+            assert "expected_program_sha256_missing" in check.fail_reasons
+            with pytest.raises(RuntimeError):
+                process.resume()
+        finally:
+            process.job.terminate()
+            process.close()
+
+
+def test_pre_resume_check_rejects_wrong_program_digest(iso_root) -> None:
+    """确定性负向：程序摘要与批准值不符 → ok=False。"""
+    with Sandbox(_spec(iso_root)) as sandbox:
+        script = sandbox.work_dir / "sleep.py"
+        script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+        sandbox._allow_restricted_read(script)
+        process = win32.spawn_restricted(
+            [default_python(), "-I", str(script)],
+            cwd=sandbox.work_dir,
+            env=win32.build_environment(),
+            restricting_sid=sandbox.restricting_sid,
+            suspended=True,
+        )
+        try:
+            check = win32.pre_resume_check(
+                process,
+                expected_token_user_sid=sandbox.parent_sid,
+                expected_restricting_sid=sandbox.restricting_sid,
+                expected_program_sha256="0" * 64,
+                program_sha256=hashlib.sha256(script.read_bytes()).hexdigest(),
+            )
+            assert check.ok is False
+            assert "program_identity_mismatch" in check.fail_reasons
         finally:
             process.job.terminate()
             process.close()

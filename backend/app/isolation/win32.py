@@ -685,10 +685,15 @@ def pre_resume_check(
 ) -> PreResumeCheck:
     """Collect + **enforce** identity evidence before ResumeThread (S9-1 gate).
 
-    The expected bindings are explicit parameters; a missing/mismatched token
-    user SID or restricting SID makes `ok` False. On `ok`, the internal resume
-    gate on `process` is opened (so `process.resume()` will succeed); otherwise
-    the caller must `process.job.terminate()` + `process.close()`.
+    Fail-closed contract: the approved TokenUser SID and restricting SID MUST be
+    supplied. A missing expected value is itself a failure (no "skip the check"
+    branch) — otherwise an unconfigured caller would silently pass the gate.
+    Program identity is likewise mandatory when a staged program digest exists;
+    pass `expected_program_sha256` and the recomputed `program_sha256`.
+
+    On `ok`, the internal resume gate on `process` is opened (so
+    `process.resume()` succeeds); otherwise the caller must
+    `process.job.terminate()` + `process.close()`.
 
     Read-only with respect to the process; never resumes on its own.
     """
@@ -696,9 +701,12 @@ def pre_resume_check(
     token_user_sid = get_process_token_user(process.handle)
     creation_time = get_process_creation_time(process.handle)
 
+    # 批准的 TokenUser SID 必须提供；缺失即拒绝（不得跳过核对）。
+    if not expected_token_user_sid:
+        fail.append("expected_token_user_sid_missing")
     if token_user_sid is None:
         fail.append("token_user_unavailable")
-    elif expected_token_user_sid is not None and token_user_sid != expected_token_user_sid:
+    elif expected_token_user_sid and token_user_sid != expected_token_user_sid:
         fail.append("token_user_mismatch")
 
     if creation_time is None:
@@ -707,16 +715,21 @@ def pre_resume_check(
     if not process.token_restricted:
         fail.append("token_not_restricted")
 
-    if expected_restricting_sid is not None and expected_restricting_sid not in process.restricting_sids:
+    # restricting SID 必须提供且确实在子进程令牌中。
+    if not expected_restricting_sid:
+        fail.append("expected_restricting_sid_missing")
+    elif expected_restricting_sid not in process.restricting_sids:
         fail.append("restricting_sid_mismatch")
 
     in_job = is_process_in_job(process.pid, process.job.handle)
     if not in_job:
         fail.append("not_in_job")
 
-    if expected_program_sha256 is not None:
-        if program_sha256 is None or program_sha256 != expected_program_sha256:
-            fail.append("program_identity_mismatch")
+    # 可信程序身份必须提供且一致；缺失摘要同样拒绝。
+    if not expected_program_sha256:
+        fail.append("expected_program_sha256_missing")
+    elif program_sha256 is None or program_sha256 != expected_program_sha256:
+        fail.append("program_identity_mismatch")
 
     check = PreResumeCheck(
         pid=process.pid,

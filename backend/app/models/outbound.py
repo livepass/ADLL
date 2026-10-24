@@ -82,11 +82,25 @@ class SendReceiptEvidence(Base):
     `ux_send_attempt_terminal` 部分唯一索引，可安全容纳多条证据行。
     """
     __tablename__ = "send_receipt_evidence"
+    __table_args__ = (
+        # 并发幂等兜底：同一 attempt 的同一收据签名只能有一条可信证据。
+        # 应用层「先查后插」在并发下会双双通过检查，数据库唯一索引负责拒绝第二次。
+        Index(
+            "ux_receipt_evidence_signature",
+            "attempt_id",
+            "kind",
+            "receipt_signature",
+            unique=True,
+            sqlite_where=text("receipt_signature IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     attempt_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     # "host_authorization" | "egress_send" | "late_receipt"
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 收据签名的独立列（可空）：供数据库唯一索引做并发幂等，不依赖 JSON 查询。
+    receipt_signature: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # 完整原始收据（含 signature/key_id 等），供离线复核；不重写 SendAuditRecord。
     receipt: Mapped[dict] = mapped_column(JSON, nullable=False)
     # 宿主验签结论：verified / signature_invalid / expired / mismatch / replayed

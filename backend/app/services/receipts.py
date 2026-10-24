@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
+
 from ..models.base import utcnow
 from ..models.outbound import SendAuditRecord, SendReceiptEvidence
 
@@ -176,6 +178,35 @@ class SendReceipt:
             "signature": self.signature,
             "provider_request_id": self.provider_request_id,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SendReceipt:
+        """跨进程传输后重建收据；缺字段即失败（不静默补默认值）。"""
+        required = (
+            "attempt_id", "authorization_id", "receiver", "request_digest",
+            "actual_body_sha256", "terminal_phase", "policy_version",
+            "issuer", "key_id", "issued_at", "expires_at", "signature",
+        )
+        missing = [k for k in required if k not in data]
+        if missing:
+            raise ValueError(f"receipt_missing_fields:{','.join(missing)}")
+        return cls(
+            attempt_id=data["attempt_id"],
+            authorization_id=int(data["authorization_id"]),
+            receiver=data["receiver"],
+            request_digest=data["request_digest"],
+            actual_body_sha256=data["actual_body_sha256"],
+            terminal_phase=data["terminal_phase"],
+            http_status=data.get("http_status"),
+            raw_response_sha256=data.get("raw_response_sha256"),
+            policy_version=data["policy_version"],
+            issuer=data["issuer"],
+            key_id=data["key_id"],
+            issued_at=data["issued_at"],
+            expires_at=data["expires_at"],
+            signature=data["signature"],
+            provider_request_id=data.get("provider_request_id"),
+        )
 
 
 def issue_host_receipt(
@@ -341,12 +372,24 @@ def verify_host_receipt(
     key: bytes,
     prepared: SendAuditRecord,
     now: datetime | None = None,
+    allowed_policy_versions: tuple[str, ...] | None = None,
 ) -> ReceiptVerification:
-    """Launcher 验签宿主授权收据：确认 prepared 行绑定，不信任调用方填写的值。"""
+    """Launcher 验签宿主授权收据：确认 prepared 行绑定，不信任调用方填写的值。
+
+    严格验证（缺一即拒绝）：
+    - 签名（覆盖全部绑定字段）
+    - `authorization_status` 必须为 `approved`（撤销/未批准不得放行）
+    - `issued_at` 合法且不晚于当前（防未来时间戳回填）
+    - `expires_at` 未过期
+    - `policy_version` 必须在 Launcher 认可的版本集合内（提供时）
+    """
     now = now or utcnow()
     values = receipt.to_dict()
     if not verify(HOST_RECEIPT_SIGNED_FIELDS, values, key, receipt.signature):
         return ReceiptVerification(False, "signature_invalid")
+    # 授权状态必须是 approved；其余状态（revoked/pending/未知）一律拒绝。
+    if receipt.authorization_status != "approved":
+        return ReceiptVerification(False, "authorization_not_approved")
     if receipt.attempt_id != prepared.attempt_id:
         return ReceiptVerification(False, "attempt_mismatch")
     if receipt.authorization_id != prepared.authorization_id:
@@ -355,8 +398,62 @@ def verify_host_receipt(
         return ReceiptVerification(False, "receiver_mismatch")
     if receipt.request_digest != prepared.request_digest:
         return ReceiptVerification(False, "request_digest_mismatch")
+    issued = _parse_iso(receipt.issued_at)
+    if issued is None:
+        return ReceiptVerification(False, "issued_at_invalid")
+    if _as_naive(issued) > _as_naive(now):
+        return ReceiptVerification(False, "issued_at_invalid")
     if _expired(receipt.expires_at, now):
         return ReceiptVerification(False, "expired")
+    if allowed_policy_versions is not None and receipt.policy_version not in allowed_policy_versions:
+        return ReceiptVerification(False, "policy_version_not_accepted")
+    return ReceiptVerification(True, "ok")
+
+
+def verify_host_receipt_against_request(
+    receipt: HostAuthorizationReceipt,
+    *,
+    key: bytes,
+    attempt_id: str,
+    authorization_id: int,
+    receiver: str,
+    request_digest: str,
+    body_sha256: str,
+    now: datetime | None = None,
+    allowed_policy_versions: tuple[str, ...] | None = None,
+) -> ReceiptVerification:
+    """Launcher 侧验证宿主授权收据——**不读取审批数据库**。
+
+    与 `verify_host_receipt` 的区别：这里没有 `SendAuditRecord` 行可查，只能把
+    收据签名字段与实际收到的请求字段逐一比对。仍严格验证 approved 状态、
+    issued_at、expires_at 与认可的 policy_version。
+    """
+    now = now or utcnow()
+    values = receipt.to_dict()
+    if not verify(HOST_RECEIPT_SIGNED_FIELDS, values, key, receipt.signature):
+        return ReceiptVerification(False, "signature_invalid")
+    if receipt.authorization_status != "approved":
+        return ReceiptVerification(False, "authorization_not_approved")
+    if receipt.attempt_id != attempt_id:
+        return ReceiptVerification(False, "attempt_mismatch")
+    if receipt.authorization_id != authorization_id:
+        return ReceiptVerification(False, "authorization_mismatch")
+    if receipt.receiver != receiver:
+        return ReceiptVerification(False, "receiver_mismatch")
+    if receipt.request_digest != request_digest:
+        return ReceiptVerification(False, "request_digest_mismatch")
+    # 实际字节必须与授权摘要一致（三方核对的第一跳）。
+    if body_sha256 != request_digest:
+        return ReceiptVerification(False, "body_digest_mismatch")
+    issued = _parse_iso(receipt.issued_at)
+    if issued is None:
+        return ReceiptVerification(False, "issued_at_invalid")
+    if _as_naive(issued) > _as_naive(now):
+        return ReceiptVerification(False, "issued_at_invalid")
+    if _expired(receipt.expires_at, now):
+        return ReceiptVerification(False, "expired")
+    if allowed_policy_versions is not None and receipt.policy_version not in allowed_policy_versions:
+        return ReceiptVerification(False, "policy_version_not_accepted")
     return ReceiptVerification(True, "ok")
 
 
@@ -380,10 +477,15 @@ def append_receipt_evidence(
     receipt: dict[str, Any],
     verification: str,
 ) -> SendReceiptEvidence:
-    """追加一条收据证据（append-only），不触碰终态唯一索引。"""
+    """追加一条收据证据（append-only），不触碰终态唯一索引。
+
+    `receipt_signature` 独立成列，供数据库唯一索引做并发幂等；同一收据重复
+    追加时由部分唯一索引拒绝（IntegrityError），调用方按「已记录」处理。
+    """
     record = SendReceiptEvidence(
         attempt_id=attempt_id,
         kind=kind,
+        receipt_signature=(receipt or {}).get("signature"),
         receipt=receipt,
         verification=verification,
     )
@@ -417,7 +519,7 @@ def record_late_receipt(
     if not has_terminal(db, receipt.attempt_id):
         # 无终态：正常路径，由调用方落唯一终态。
         return ReceiptVerification(True, "ok")
-    # 幂等：同一收据（同签名）重复提交不得产生重复可信证据。
+    # 幂等（应用层快路径）：同一收据（同签名）重复提交不得产生重复可信证据。
     existing = (
         db.query(SendReceiptEvidence)
         .filter_by(attempt_id=receipt.attempt_id, kind="late_receipt")
@@ -427,11 +529,17 @@ def record_late_receipt(
         if (row.receipt or {}).get("signature") == receipt.signature:
             return ReceiptVerification(True, "ok", reason="late_receipt_already_recorded")
     # 已有终态：迟到收据 → 追加证据，不改写历史。
-    append_receipt_evidence(
-        db,
-        attempt_id=receipt.attempt_id,
-        kind="late_receipt",
-        receipt=receipt.to_dict(),
-        verification="verified",
-    )
+    # 并发兜底：唯一索引 (attempt_id, kind, receipt_signature) 会拒绝第二次插入，
+    # 此时按「已记录」返回，不产生重复可信证据。
+    try:
+        append_receipt_evidence(
+            db,
+            attempt_id=receipt.attempt_id,
+            kind="late_receipt",
+            receipt=receipt.to_dict(),
+            verification="verified",
+        )
+    except IntegrityError:
+        db.rollback()
+        return ReceiptVerification(True, "ok", reason="late_receipt_already_recorded")
     return ReceiptVerification(True, "ok", reason="late_receipt_appended")

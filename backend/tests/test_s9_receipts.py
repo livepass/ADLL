@@ -444,3 +444,129 @@ def test_receipt_evidence_forbids_update_and_delete(app) -> None:
         assert kept is not None and kept.verification == "verified"
     finally:
         db.close()
+
+
+def test_host_receipt_rejects_non_approved_status(app) -> None:
+    """宿主授权收据状态非 approved（如 revoked）→ 拒绝放行。"""
+    db = _db(app)
+    try:
+        prepared = _prepared(db, attempt_id="host_rev", auth_id=11)
+        # 用 revoked 状态签发（签名有效，但状态不合法）。
+        issued = receipts._now_iso()
+        expires = receipts._expires_after(issued, 300)
+        values = {
+            "attempt_id": prepared.attempt_id,
+            "authorization_id": prepared.authorization_id,
+            "receiver": prepared.receiver,
+            "request_digest": prepared.request_digest,
+            "authorization_status": "revoked",
+            "policy_version": "v1",
+            "key_id": KEY_ID,
+            "issued_at": issued,
+            "expires_at": expires,
+        }
+        sig = receipts.sign(receipts.HOST_RECEIPT_SIGNED_FIELDS, values, KEY)
+        revoked = HostAuthorizationReceipt(
+            attempt_id=prepared.attempt_id,
+            authorization_id=prepared.authorization_id,
+            receiver=prepared.receiver,
+            request_digest=prepared.request_digest,
+            authorization_status="revoked",
+            policy_version="v1",
+            key_id=KEY_ID,
+            issued_at=issued,
+            expires_at=expires,
+            signature=sig,
+        )
+        result = verify_host_receipt(revoked, key=KEY, prepared=prepared)
+        assert result.ok is False and result.code == "authorization_not_approved"
+    finally:
+        db.close()
+
+
+def test_host_receipt_rejects_future_issued_at(app) -> None:
+    """宿主授权收据签发时间在未来 → 拒绝。"""
+    db = _db(app)
+    try:
+        prepared = _prepared(db, attempt_id="host_future", auth_id=12)
+        future = (utcnow() + timedelta(hours=1)).isoformat()
+        later = (utcnow() + timedelta(hours=2)).isoformat()
+        values = {
+            "attempt_id": prepared.attempt_id,
+            "authorization_id": prepared.authorization_id,
+            "receiver": prepared.receiver,
+            "request_digest": prepared.request_digest,
+            "authorization_status": "approved",
+            "policy_version": "v1",
+            "key_id": KEY_ID,
+            "issued_at": future,
+            "expires_at": later,
+        }
+        sig = receipts.sign(receipts.HOST_RECEIPT_SIGNED_FIELDS, values, KEY)
+        fut = HostAuthorizationReceipt(
+            attempt_id=prepared.attempt_id,
+            authorization_id=prepared.authorization_id,
+            receiver=prepared.receiver,
+            request_digest=prepared.request_digest,
+            authorization_status="approved",
+            policy_version="v1",
+            key_id=KEY_ID,
+            issued_at=future,
+            expires_at=later,
+            signature=sig,
+        )
+        result = verify_host_receipt(fut, key=KEY, prepared=prepared)
+        assert result.ok is False and result.code == "issued_at_invalid"
+    finally:
+        db.close()
+
+
+def test_host_receipt_rejects_unaccepted_policy_version(app) -> None:
+    """宿主授权收据的策略版本不在 Launcher 认可集合 → 拒绝。"""
+    db = _db(app)
+    try:
+        prepared = _prepared(db, attempt_id="host_pol", auth_id=13)
+        receipt = issue_host_receipt(
+            attempt_id=prepared.attempt_id,
+            authorization_id=prepared.authorization_id,
+            receiver=prepared.receiver,
+            request_digest=prepared.request_digest,
+            policy_version="v1",
+            key_id=KEY_ID,
+            key=KEY,
+        )
+        result = verify_host_receipt(
+            receipt, key=KEY, prepared=prepared, allowed_policy_versions=("v2",)
+        )
+        assert result.ok is False and result.code == "policy_version_not_accepted"
+    finally:
+        db.close()
+
+
+def test_receipt_evidence_unique_index_blocks_concurrent_duplicate(app) -> None:
+    """并发兜底：同一 (attempt_id, kind, signature) 第二次插入被唯一索引拒绝。"""
+    from sqlalchemy.exc import IntegrityError
+
+    db = _db(app)
+    try:
+        prepared = _prepared(db, attempt_id="race1")
+        payload = {"attempt_id": prepared.attempt_id, "signature": "same-sig"}
+        append_receipt_evidence(
+            db, attempt_id=prepared.attempt_id, kind="late_receipt",
+            receipt=payload, verification="verified",
+        )
+        # 第二次（模拟并发写入者绕过应用层快路径）必须被数据库拒绝。
+        with pytest.raises(IntegrityError):
+            append_receipt_evidence(
+                db, attempt_id=prepared.attempt_id, kind="late_receipt",
+                receipt=payload, verification="verified",
+            )
+        db.rollback()
+        assert (
+            db.query(SendReceiptEvidence)
+            .filter_by(attempt_id=prepared.attempt_id, kind="late_receipt")
+            .count()
+            == 1
+        )
+    finally:
+        db.close()
