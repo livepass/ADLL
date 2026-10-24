@@ -143,6 +143,16 @@ class WorkerAgentAdapter(AgentAdapter):
         body_bytes = (
             canonical_payload_bytes(request.payload) if mode == "real" else None
         )
+        # S9-2：授权摘要必须来自已持久化 prepared 审计行（request.request_digest），
+        # 不得由 adapter 自行生成替代值。真实发送要求两者都提供且一致。
+        request_digest = request.request_digest
+        if mode == "real":
+            if not isinstance(request_digest, str) or not request_digest:
+                raise AdapterDisabled("request_digest_missing")
+            # 用不可变请求字节核对授权摘要：重算仅为比对，不当作新的授权摘要。
+            recomputed = hashlib.sha256(body_bytes).hexdigest()
+            if recomputed != request_digest:
+                raise AdapterDisabled("request_digest_mismatch")
         job = {
             "mode": mode,
             "synthetic_allowed": self.synthetic,
@@ -153,8 +163,8 @@ class WorkerAgentAdapter(AgentAdapter):
             "timeout": self.timeout,
         }
         if body_bytes is not None:
-            # worker 在发送前重算该摘要：授权通道与审计摘要是同一字节序列。
-            job["request_digest"] = hashlib.sha256(body_bytes).hexdigest()
+            # 直接把持久化授权摘要传给 worker；worker 发送前对不可变字节复核。
+            job["request_digest"] = request_digest
         key = str(request.execution_id or request.idempotency_key or id(request))
         with Sandbox(self._spec()) as sandbox:
             with self._active_lock:

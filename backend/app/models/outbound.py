@@ -72,3 +72,23 @@ class SendAuditRecord(Base):
     request_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class SendReceiptEvidence(Base):
+    """append-only 收据证据（S9-2）：不参与一次尝试的唯一终态约束。
+
+    迟到收据（宿主重启后，attempt 已被 reconcile 补记 possibly_sent）必须以
+    追加证据方式保留，而不是写入第二条终态。本表独立于
+    `ux_send_attempt_terminal` 部分唯一索引，可安全容纳多条证据行。
+    """
+    __tablename__ = "send_receipt_evidence"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attempt_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # "host_authorization" | "egress_send" | "late_receipt"
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 完整原始收据（含 signature/key_id 等），供离线复核；不重写 SendAuditRecord。
+    receipt: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 宿主验签结论：verified / signature_invalid / expired / mismatch / replayed
+    verification: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

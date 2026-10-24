@@ -14,7 +14,7 @@ from .audit import AuditLog, SecurityEvent
 from .generation import GenerationExecution, VerificationAttempt
 from .idempotency import IdempotencyRecord
 from .late_result import LateResultRecord
-from .outbound import OutboundAuthorization, SendAuditRecord
+from .outbound import OutboundAuthorization, SendAuditRecord, SendReceiptEvidence
 from .proposal import ApprovalEvent, Feedback, ProposalVersion
 from .repository import AnalysisBaseline, GitRepository
 from .session import UserSession
@@ -36,6 +36,7 @@ __all__ = [
     "LateResultRecord",
     "OutboundAuthorization",
     "SendAuditRecord",
+    "SendReceiptEvidence",
     "ApprovalEvent",
     "Feedback",
     "ProposalVersion",

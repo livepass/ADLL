@@ -1,6 +1,6 @@
 # S9 IPC 与安全证据接口契约草案
 
-**日期**：2026-10-24（R2 定向修订；R3 补三项收口 §2.1 / §5.1 / §6.1）　**状态**：DRAFT（待审批；不改已批准 contracts/agent-adapter.md）
+**日期**：2026-10-24（R2 定向修订；R3 补 §2.1/§5.1/§6.1；R4 补 §5.1 全字段签名 + §6.2）　**状态**：DRAFT（待审批；不改已批准 contracts/agent-adapter.md）
 **上位**：[s9-detailed-plan.md](./s9-detailed-plan.md)、[s9-isolation-architecture-decision.md](./s9-isolation-architecture-decision.md)
 
 本契约定义「FastAPI 宿主 ↔ 受保护启动器/Worker VM ↔ 固定出口」之间的最小接口与
@@ -131,8 +131,8 @@ SendReceipt {
 固定出口的签名收据不得只是一句「已转发某 attempt」——它必须由出口**对其真实转发
 的字节**与请求上下文一并签名，使收据可被宿主独立复核到「这一次实际请求」。
 
-`SendReceipt` 的**签名覆盖内容（规范化后签名）**至少包含以下字段（任一缺失或对不上
-即视为签名不符、不落终态）：
+`SendReceipt` 的**签名覆盖内容（规范化后签名）**必须覆盖**全部影响发送事实及有效性**
+的字段（任一缺失或对不上即视为签名不符、不落终态）：
 
 | 字段 | 来源 | 说明 |
 |---|---|---|
@@ -141,18 +141,25 @@ SendReceipt {
 | `receiver` | 宿主（固定上游端点） | 出口实际连接的上游端点，必须等于 prepared 行 |
 | `request_digest` | 宿主对不可变请求体算得 | prepared 行已持久化的 SHA-256 |
 | `actual_body_sha256` | Egress 对**实际转发字节**重算 | 出口真实收到的请求体摘要；宿主据此与 `request_digest` 比对 |
+| `terminal_phase` | Egress | 终态判定（confirmed_sent / possibly_sent / not_sent），签名必须绑定，防止终态被改写 |
+| `http_status` | Egress | 上游 HTTP 状态；影响「是否确实已发送」的事实，必须签名覆盖 |
+| `raw_response_sha256` | Egress | 原始响应字节摘要；影响发送事实的证据，必须签名覆盖 |
 | `policy_version` | Egress | 出口生效的转发/校验策略版本 |
 | `issuer` | 常量 `"egress"` | 签发者身份 |
 | `key_id` | Egress | 本次签名所用密钥标识（支持轮换） |
+| `issued_at` | Egress | 签发时间，进入签名体，防止回填 |
+| `expires_at` | Egress | 过期时间，进入签名体，防止陈旧收据重放 |
 
 规范化与签名方式：
 
 - 上述字段按**固定键名排序**拼接为规范化字节串（`canonical_payload_bytes` 同源
   算法，UTF-8、`ensure_ascii=False`、`sort_keys=True`），再以 Egress 私钥签名；
-  `key_id` 一并进入签名体，宿主用对应公钥验签。
+  `key_id`、`issued_at`、`expires_at` 一并进入签名体，宿主用对应公钥验签。
 - `actual_body_sha256` 是出口对**实际接收字节**独立重算的摘要，不是回显宿主传入的
   `request_digest`；出口禁止把调用方/宿主传来的 `request_digest` 原样写回收据充当
   `actual_body_sha256`。
+- 终态、HTTP 状态、原始响应摘要、签发时间、过期时间均为**签名覆盖字段**：任何一项
+  被篡改都会导致验签失败；因此「签名的收据」即「可信的发送事实 + 有效期」的原子绑定。
 
 宿主验证方式（收到收据后）：
 
@@ -197,6 +204,20 @@ SendReceipt {
    - `attempt_id` 重复 / 已有终态 → 只按「已终结」拒绝，不改写、不追加第二次终态；
    - 收到收据但无法确证其与 prepared 行一致 → 保持 `possibly_sent`，绝不升格
      `confirmed_sent`。
+
+### 6.2 过期收据与撤销边界的信任分离
+
+- **过期收据不能成为新发送授权**：`expires_at` 已过的收据（无论签名是否有效）不得
+  作为任何新 attempt 的授权来源，也不得据此判 `confirmed_sent`。审计保留与信任判定
+  分离——过期收据可以因审计需要保留为证据（若签名有效且 attempt 匹配），但其
+  **信任值恒为零**：不落终态、不升格状态、不生成 verified。
+- **授权撤销与收据签发之间的生效边界必须可验证**：宿主在 `attempt_id` 落 prepared 时
+  记录授权快照（`authorization_status`、`policy_version`、快照时间）。Egress 签发的
+  收据必须带 `issued_at` 与 `policy_version`；宿主核验时要求
+  `issued_at >= prepared 快照时间` 且 `policy_version` 与快照一致。若授权在 prepared
+  之后、`issued_at` 之前被撤销，宿主必须在核验时拒绝（收据虽签名有效，但其签发生效
+  边界落在撤销之后）。该判定由宿主依据「撤销时间 vs 收据签发时间」的时序完成，不
+  依赖 Egress 自证。
 
 ## 7. 固定请求体 vs 实际发送字节 SHA-256 对账
 

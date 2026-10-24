@@ -20,6 +20,10 @@ class GenerationRequest:
     idempotency_key: str | None = None
     payload: dict[str, Any] | None = None
     execution_id: int | None = None
+    # S9-2：审计绑定。attempt_id 来自已持久化 prepared 审计行；
+    # request_digest 是该行记录的授权摘要，adapter 不得自行生成替代值。
+    attempt_id: str | None = None
+    request_digest: str | None = None
 
 
 @dataclass

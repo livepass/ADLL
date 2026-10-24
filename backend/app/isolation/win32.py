@@ -48,6 +48,7 @@ TokenRestrictedSids = 11
 DISABLE_MAX_PRIVILEGE = 0x1
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NO_WINDOW = 0x08000000
+CREATE_SUSPENDED = 0x00000004
 STARTF_USESTDHANDLES = 0x00000100
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JobObjectExtendedLimitInformation = 9
@@ -148,6 +149,8 @@ kernel32.SetInformationJobObject.argtypes = [
 kernel32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
 kernel32.AssignProcessToJobObject.restype = wt.BOOL
 kernel32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+kernel32.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
+kernel32.TerminateProcess.restype = wt.BOOL
 kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
 kernel32.WaitForSingleObject.restype = wt.DWORD
 kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
@@ -201,6 +204,12 @@ advapi32.IsTokenRestricted.argtypes = [wt.HANDLE]
 advapi32.IsTokenRestricted.restype = wt.BOOL
 kernel32.IsProcessInJob.argtypes = [wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.BOOL)]
 kernel32.IsProcessInJob.restype = wt.BOOL
+kernel32.ResumeThread.argtypes = [wt.HANDLE]
+kernel32.ResumeThread.restype = wt.DWORD
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.GetProcessTimes.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+kernel32.GetProcessTimes.restype = wt.BOOL
 
 # 运行 Python/系统 DLL 所需的公共 SID（不包含当前用户 SID）。
 DEFAULT_RESTRICTING_SIDS = (
@@ -290,6 +299,61 @@ def current_user_sid() -> str:
             kernel32.LocalFree(string_ptr)
     finally:
         kernel32.CloseHandle(token)
+
+
+def get_process_token_user(process_handle: int) -> str | None:
+    """Return the TokenUser SID of a (possibly suspended) child process.
+
+    This is the pre-resume identity check primitive: before `ResumeThread` the
+    launcher must confirm the child really runs under the approved principal.
+    Returns None when the token cannot be queried (caller must fail-closed).
+    """
+    token = wt.HANDLE()
+    if not advapi32.OpenProcessToken(process_handle, TOKEN_QUERY, ctypes.byref(token)):
+        return None
+    try:
+        size = wt.DWORD(0)
+        advapi32.GetTokenInformation(token, TokenUser, None, 0, ctypes.byref(size))
+        if size.value == 0:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(
+            token, TokenUser, buffer, size, ctypes.byref(size)
+        ):
+            return None
+        token_user = ctypes.cast(buffer, ctypes.POINTER(TOKEN_USER)).contents
+        string_ptr = ctypes.c_void_p()
+        if not advapi32.ConvertSidToStringSidW(
+            token_user.User.Sid, ctypes.byref(string_ptr)
+        ):
+            return None
+        try:
+            return ctypes.wstring_at(string_ptr.value)
+        finally:
+            kernel32.LocalFree(string_ptr)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def get_process_creation_time(process_handle: int) -> int | None:
+    """Return the child's creation FILETIME (as int) for pre-resume binding.
+
+    Combined with the PID this lets the launcher confirm it is inspecting the
+    very process it just created (no PID-reuse confusion).
+    """
+    create = ctypes.c_ulonglong()
+    exit_t = ctypes.c_ulonglong()
+    kernel_t = ctypes.c_ulonglong()
+    user_t = ctypes.c_ulonglong()
+    if not kernel32.GetProcessTimes(
+        process_handle,
+        ctypes.byref(create),
+        ctypes.byref(exit_t),
+        ctypes.byref(kernel_t),
+        ctypes.byref(user_t),
+    ):
+        return None
+    return int(create.value)
 
 
 class RestrictedToken:
@@ -415,6 +479,8 @@ class RestrictedProcess:
     token_restricted: bool
     restricting_sids: list[str] = field(default_factory=list)
     restricting_sid_attributes: dict[str, int] = field(default_factory=dict)
+    # CREATE_SUSPENDED 时保留主线程句柄，供恢复前复核后 ResumeThread。
+    thread_handle: int | None = None
 
     def wait(self, timeout_ms: int) -> int:
         result = kernel32.WaitForSingleObject(self.handle, timeout_ms)
@@ -426,9 +492,24 @@ class RestrictedProcess:
             raise ctypes.WinError(ctypes.get_last_error())
         return int(code.value)
 
+    def resume(self) -> None:
+        """Resume a CREATE_SUSPENDED process after the pre-resume identity check.
+
+        Callers must run `pre_resume_check` first; resuming without a passing
+        check is a bug and is not enforced here (the check returns the evidence
+        the caller must act on)."""
+        if self.thread_handle is None:
+            return
+        # 恢复失败（如已退出）返回 0xFFFFFFFF；主线程不复用，失败即视为异常。
+        if kernel32.ResumeThread(self.thread_handle) == 0xFFFFFFFF:
+            raise ctypes.WinError(ctypes.get_last_error())
+
     def close(self) -> None:
         # 先关闭 Job（kill-on-close）再释放进程句柄；确保子进程树不遗留。
         self.job.close()
+        if self.thread_handle is not None:
+            kernel32.CloseHandle(self.thread_handle)
+            self.thread_handle = None
         if self.handle:
             kernel32.CloseHandle(self.handle)
             self.handle = None
@@ -443,13 +524,25 @@ def spawn_restricted(
     restricting_sid: str | None = None,
     stdout_path: Path | None = None,
     stderr_path: Path | None = None,
+    suspended: bool = False,
 ) -> RestrictedProcess:
+    """Spawn the worker under a restricted token inside a kill-on-close Job.
+
+    `suspended=True` creates the process with CREATE_SUSPENDED and leaves the
+    primary thread suspended. The caller MUST run `pre_resume_check()` and act
+    on its result before calling `process.resume()`; resuming without a passing
+    check violates the S9-1 identity gate. Default False preserves the existing
+    non-suspended behaviour used by probe/worker launch paths.
+    """
     token = create_restricted_token(restricting_sid)
     job = JobObject()
     startup = STARTUPINFOW()
     startup.cb = ctypes.sizeof(startup)
     opened: list[int] = []
     handles: list[int] = []
+    creation_flags = CREATE_UNICODE_ENVIRONMENT
+    if suspended:
+        creation_flags |= CREATE_SUSPENDED
     try:
         if stdout_path is not None or stderr_path is not None:
             std_out = stdout_path or stderr_path
@@ -479,7 +572,7 @@ def spawn_restricted(
             None,
             None,
             bool(opened),
-            CREATE_UNICODE_ENVIRONMENT,
+            creation_flags,
             ctypes.cast(env_block, ctypes.c_void_p),
             str(cwd),
             ctypes.byref(startup),
@@ -493,15 +586,23 @@ def spawn_restricted(
     finally:
         for fd in opened:
             os.close(fd)
+    # 纳管失败必须 terminate + wait：仅关闭未纳管进程句柄会遗留失控进程树。
     try:
         job.assign(process_info.hProcess)
     except OSError:
-        job.close()
-        token.close()
-        kernel32.CloseHandle(process_info.hProcess)
-        kernel32.CloseHandle(process_info.hThread)
+        # 先终止进程（及其可能的子进程），再等待其退出，最后释放所有句柄。
+        try:
+            kernel32.TerminateProcess(process_info.hProcess, 1)
+            kernel32.WaitForSingleObject(process_info.hProcess, 5000)
+        finally:
+            job.close()
+            token.close()
+            kernel32.CloseHandle(process_info.hThread)
+            kernel32.CloseHandle(process_info.hProcess)
         raise
-    kernel32.CloseHandle(process_info.hThread)
+    thread_handle = process_info.hThread if suspended else None
+    if not suspended:
+        kernel32.CloseHandle(process_info.hThread)
     process_token = wt.HANDLE()
     token_restricted = False
     restricted_sids: list[str] = []
@@ -520,6 +621,8 @@ def spawn_restricted(
         # 未能证明子进程使用受限令牌 → 立即失败，绝不降级运行。
         job.terminate()
         job.close()
+        if thread_handle is not None:
+            kernel32.CloseHandle(thread_handle)
         token.close()
         kernel32.CloseHandle(process_info.hProcess)
         raise OSError("child process token is not restricted")
@@ -531,6 +634,45 @@ def spawn_restricted(
         token_restricted=True,
         restricting_sids=restricted_sids,
         restricting_sid_attributes=restricted_sid_attrs,
+        thread_handle=thread_handle,
+    )
+
+
+@dataclass(frozen=True)
+class PreResumeCheck:
+    """Evidence the launcher collects while the worker is still suspended.
+
+    `ok` is True only when every check passes. The caller must terminate (not
+    resume) the process on any non-ok result; resuming is a separate explicit
+    call so the decision stays in the caller's hands.
+    """
+    pid: int
+    token_user_sid: str | None
+    creation_time: int | None
+    token_restricted: bool
+    restricting_sids: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return (
+            self.token_user_sid is not None
+            and self.creation_time is not None
+            and self.token_restricted
+        )
+
+
+def pre_resume_check(process: RestrictedProcess) -> PreResumeCheck:
+    """Collect identity evidence before ResumeThread (S9-1 pre-resume gate).
+
+    Read-only; never resumes. On non-ok the caller is responsible for calling
+    `process.job.terminate()` + `process.close()` instead of `process.resume()`.
+    """
+    return PreResumeCheck(
+        pid=process.pid,
+        token_user_sid=get_process_token_user(process.handle),
+        creation_time=get_process_creation_time(process.handle),
+        token_restricted=process.token_restricted,
+        restricting_sids=tuple(process.restricting_sids),
     )
 
 
