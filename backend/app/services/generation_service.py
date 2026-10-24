@@ -202,6 +202,8 @@ def _run_body(
         # S9-2：直接绑定已持久化 prepared 审计记录，而不是让 adapter 自算。
         attempt_id=attempt_id,
         request_digest=prepared.request_digest,
+        authorization_id=auth_id,
+        receiver=prepared.receiver,
     )
     try:
         result = adapter.generate(request)

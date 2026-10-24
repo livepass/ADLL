@@ -481,6 +481,8 @@ class RestrictedProcess:
     restricting_sid_attributes: dict[str, int] = field(default_factory=dict)
     # CREATE_SUSPENDED 时保留主线程句柄，供恢复前复核后 ResumeThread。
     thread_handle: int | None = None
+    # 恢复前身份检查是否已通过（由 pre_resume_check 在 ok 时置位）。
+    _pre_resume_ok: bool = field(default=False, init=False, repr=False)
 
     def wait(self, timeout_ms: int) -> int:
         result = kernel32.WaitForSingleObject(self.handle, timeout_ms)
@@ -493,13 +495,17 @@ class RestrictedProcess:
         return int(code.value)
 
     def resume(self) -> None:
-        """Resume a CREATE_SUSPENDED process after the pre-resume identity check.
+        """Resume a CREATE_SUSPENDED process — only after a passing pre-resume check.
 
-        Callers must run `pre_resume_check` first; resuming without a passing
-        check is a bug and is not enforced here (the check returns the evidence
-        the caller must act on)."""
+        `pre_resume_check()` must have returned `ok=True` (which sets the
+        internal gate) before `resume()` is called. Resuming a suspended worker
+        whose identity has not been confirmed is forbidden and raises here.
+        """
         if self.thread_handle is None:
+            # 非挂起创建（suspended=False）：无恢复步骤，直接返回。
             return
+        if not self._pre_resume_ok:
+            raise RuntimeError("resume denied: pre-resume identity check not passed")
         # 恢复失败（如已退出）返回 0xFFFFFFFF；主线程不复用，失败即视为异常。
         if kernel32.ResumeThread(self.thread_handle) == 0xFFFFFFFF:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -642,38 +648,92 @@ def spawn_restricted(
 class PreResumeCheck:
     """Evidence the launcher collects while the worker is still suspended.
 
-    `ok` is True only when every check passes. The caller must terminate (not
-    resume) the process on any non-ok result; resuming is a separate explicit
-    call so the decision stays in the caller's hands.
+    `ok` is True only when **every** expected binding is verified:
+    - TokenUser SID == expected_token_user_sid（批准主体）
+    - token is restricted and carries the expected restricting SID
+    - creation time / pid are present（防止 PID 复用混淆）
+    - the process is confirmed inside the expected Job（`in_job`）
+    - program identity matches `expected_program_sha256`（若提供）
+
+    On non-ok the caller must terminate + wait (not resume); the mismatch reason
+    is reported in `fail_reasons` for diagnostics.
     """
     pid: int
     token_user_sid: str | None
     creation_time: int | None
     token_restricted: bool
     restricting_sids: tuple[str, ...] = ()
+    expected_token_user_sid: str | None = None
+    expected_restricting_sid: str | None = None
+    expected_program_sha256: str | None = None
+    program_sha256: str | None = None
+    in_job: bool = False
+    fail_reasons: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
-        return (
-            self.token_user_sid is not None
-            and self.creation_time is not None
-            and self.token_restricted
-        )
+        return not self.fail_reasons
 
 
-def pre_resume_check(process: RestrictedProcess) -> PreResumeCheck:
-    """Collect identity evidence before ResumeThread (S9-1 pre-resume gate).
+def pre_resume_check(
+    process: RestrictedProcess,
+    *,
+    expected_token_user_sid: str | None,
+    expected_restricting_sid: str | None,
+    expected_program_sha256: str | None = None,
+    program_sha256: str | None = None,
+) -> PreResumeCheck:
+    """Collect + **enforce** identity evidence before ResumeThread (S9-1 gate).
 
-    Read-only; never resumes. On non-ok the caller is responsible for calling
-    `process.job.terminate()` + `process.close()` instead of `process.resume()`.
+    The expected bindings are explicit parameters; a missing/mismatched token
+    user SID or restricting SID makes `ok` False. On `ok`, the internal resume
+    gate on `process` is opened (so `process.resume()` will succeed); otherwise
+    the caller must `process.job.terminate()` + `process.close()`.
+
+    Read-only with respect to the process; never resumes on its own.
     """
-    return PreResumeCheck(
+    fail: list[str] = []
+    token_user_sid = get_process_token_user(process.handle)
+    creation_time = get_process_creation_time(process.handle)
+
+    if token_user_sid is None:
+        fail.append("token_user_unavailable")
+    elif expected_token_user_sid is not None and token_user_sid != expected_token_user_sid:
+        fail.append("token_user_mismatch")
+
+    if creation_time is None:
+        fail.append("creation_time_unavailable")
+
+    if not process.token_restricted:
+        fail.append("token_not_restricted")
+
+    if expected_restricting_sid is not None and expected_restricting_sid not in process.restricting_sids:
+        fail.append("restricting_sid_mismatch")
+
+    in_job = is_process_in_job(process.pid, process.job.handle)
+    if not in_job:
+        fail.append("not_in_job")
+
+    if expected_program_sha256 is not None:
+        if program_sha256 is None or program_sha256 != expected_program_sha256:
+            fail.append("program_identity_mismatch")
+
+    check = PreResumeCheck(
         pid=process.pid,
-        token_user_sid=get_process_token_user(process.handle),
-        creation_time=get_process_creation_time(process.handle),
+        token_user_sid=token_user_sid,
+        creation_time=creation_time,
         token_restricted=process.token_restricted,
         restricting_sids=tuple(process.restricting_sids),
+        expected_token_user_sid=expected_token_user_sid,
+        expected_restricting_sid=expected_restricting_sid,
+        expected_program_sha256=expected_program_sha256,
+        program_sha256=program_sha256,
+        in_job=in_job,
+        fail_reasons=tuple(fail),
     )
+    if check.ok:
+        process._pre_resume_ok = True  # noqa: SLF001 — 同一模块内合法置位
+    return check
 
 
 def is_process_alive(pid: int) -> bool:

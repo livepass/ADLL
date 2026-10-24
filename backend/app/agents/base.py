@@ -24,6 +24,10 @@ class GenerationRequest:
     # request_digest 是该行记录的授权摘要，adapter 不得自行生成替代值。
     attempt_id: str | None = None
     request_digest: str | None = None
+    # S9-2 完整绑定：authorization_id 与 receiver 也必须来自 prepared/授权记录，
+    # 供 adapter 在发送前做 attempt/authorization/receiver/request_digest 一致性校验。
+    authorization_id: int | None = None
+    receiver: str | None = None
 
 
 @dataclass

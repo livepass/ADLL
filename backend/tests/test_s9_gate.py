@@ -33,6 +33,12 @@ def _request() -> GenerationRequest:
         feedback_texts=[],
         send_manifest={"source": []},
         payload={"model": "m", "max_tokens": 256, "messages": [{"role": "user", "content": "x"}]},
+        # S9-2 完整绑定：提供合法 attempt_id/authorization_id/receiver/request_digest，
+        # 使测试真正走到 S9 网络门禁，而非被绑定校验提前拦截。
+        attempt_id="gate-test-attempt",
+        authorization_id=1,
+        receiver="https://dashscope.aliyuncs.com/apps/anthropic/v1/messages",
+        request_digest="g" * 64,
     )
 
 

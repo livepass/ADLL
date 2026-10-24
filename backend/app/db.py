@@ -44,6 +44,10 @@ SQLITE_GUARDS: tuple[str, ...] = (
     "BEGIN SELECT RAISE(ABORT,'late_result_records is append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS late_no_delete BEFORE DELETE ON late_result_records "
     "BEGIN SELECT RAISE(ABORT,'late_result_records is append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS send_receipt_evidence_no_update BEFORE UPDATE ON send_receipt_evidence "
+    "BEGIN SELECT RAISE(ABORT,'send_receipt_evidence is append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS send_receipt_evidence_no_delete BEFORE DELETE ON send_receipt_evidence "
+    "BEGIN SELECT RAISE(ABORT,'send_receipt_evidence is append-only'); END",
 )
 
 

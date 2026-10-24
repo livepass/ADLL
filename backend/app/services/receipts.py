@@ -27,6 +27,7 @@ from ..models.base import utcnow
 from ..models.outbound import SendAuditRecord, SendReceiptEvidence
 
 # 出口收据签名覆盖的字段（固定顺序规范化）：任一缺失即签名不符。
+# 覆盖全部影响发送事实及有效性的字段（与 R4 契约 §5.1 逐项一致）。
 SEND_RECEIPT_SIGNED_FIELDS = (
     "attempt_id",
     "authorization_id",
@@ -36,6 +37,7 @@ SEND_RECEIPT_SIGNED_FIELDS = (
     "terminal_phase",
     "http_status",
     "raw_response_sha256",
+    "provider_request_id",
     "policy_version",
     "issuer",
     "key_id",
@@ -82,19 +84,28 @@ def _now_iso() -> str:
     return utcnow().isoformat()
 
 
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _as_naive(dt: datetime) -> datetime:
+    if dt.tzinfo is not None:
+        return dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
+
+
 def _expired(expires_at: str | None, now: datetime) -> bool:
     if not expires_at:
         return True
-    try:
-        parsed = datetime.fromisoformat(expires_at)
-    except ValueError:
+    parsed = _parse_iso(expires_at)
+    if parsed is None:
         return True
-    # 统一为 naive UTC 比较：utcnow() 返回 naive UTC，避免 aware/naive 混比。
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
-    if now.tzinfo is not None:
-        now = now.astimezone(UTC).replace(tzinfo=None)
-    return parsed <= now
+    return _as_naive(parsed) <= _as_naive(now)
 
 
 @dataclass(frozen=True)
@@ -235,6 +246,7 @@ def issue_send_receipt(
         "terminal_phase": terminal_phase,
         "http_status": http_status,
         "raw_response_sha256": raw_response_sha256,
+        "provider_request_id": provider_request_id,
         "policy_version": policy_version,
         "issuer": "egress",
         "key_id": key_id,
@@ -286,11 +298,13 @@ def verify_send_receipt(
     key: bytes,
     prepared: SendAuditRecord,
     now: datetime | None = None,
+    expected_policy_version: str | None = None,
 ) -> ReceiptVerification:
-    """宿主验签出口收据：签名 + 绑定 + 字节摘要 + 有效期。
+    """宿主验签出口收据：签名 + 绑定 + 字节摘要 + 签发/有效期 + 策略版本。
 
     失败码区分：signature_invalid / attempt_mismatch / authorization_mismatch /
-    receiver_mismatch / body_digest_mismatch / expired / already_finalized。
+    receiver_mismatch / body_digest_mismatch / expired / issuer_invalid /
+    issued_at_invalid / policy_version_mismatch。
     """
     now = now or utcnow()
     values = receipt.to_dict()
@@ -309,6 +323,15 @@ def verify_send_receipt(
         return ReceiptVerification(False, "expired")
     if receipt.issuer != "egress":
         return ReceiptVerification(False, "issuer_invalid")
+    # 签发时间必须有效（存在且不晚于当前，防未来时间戳回填）。
+    issued = _parse_iso(receipt.issued_at)
+    if issued is None:
+        return ReceiptVerification(False, "issued_at_invalid")
+    if issued > _as_naive(now):
+        return ReceiptVerification(False, "issued_at_invalid")
+    # 策略版本：若宿主侧有认可的预期版本，必须一致。
+    if expected_policy_version is not None and receipt.policy_version != expected_policy_version:
+        return ReceiptVerification(False, "policy_version_mismatch")
     return ReceiptVerification(True, "ok")
 
 
@@ -381,6 +404,8 @@ def record_late_receipt(
 
     - 若 attempt 尚无终态 → 交由调用方按正常收据落唯一终态（此处返回 ok）。
     - 若已有终态 → 只追加证据，绝不写第二条终态；过期/签名不符不落任何证据。
+    - 同一迟到收据重复提交幂等：以 (attempt_id, signature) 判定，已存在则不重复
+      插入可信证据，返回 reason="late_receipt_already_recorded"。
     """
     now = utcnow()
     # 过期收据不能成为信任依据，也不落证据。
@@ -392,6 +417,15 @@ def record_late_receipt(
     if not has_terminal(db, receipt.attempt_id):
         # 无终态：正常路径，由调用方落唯一终态。
         return ReceiptVerification(True, "ok")
+    # 幂等：同一收据（同签名）重复提交不得产生重复可信证据。
+    existing = (
+        db.query(SendReceiptEvidence)
+        .filter_by(attempt_id=receipt.attempt_id, kind="late_receipt")
+        .all()
+    )
+    for row in existing:
+        if (row.receipt or {}).get("signature") == receipt.signature:
+            return ReceiptVerification(True, "ok", reason="late_receipt_already_recorded")
     # 已有终态：迟到收据 → 追加证据，不改写历史。
     append_receipt_evidence(
         db,

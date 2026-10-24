@@ -147,6 +147,17 @@ class WorkerAgentAdapter(AgentAdapter):
         # 不得由 adapter 自行生成替代值。真实发送要求两者都提供且一致。
         request_digest = request.request_digest
         if mode == "real":
+            # 完整绑定校验：attempt/authorization/receiver/request_digest 缺一即零外发。
+            # adapter 不得自造 attempt_id 或授权摘要；一切取自 prepared 审计行。
+            if not isinstance(request.attempt_id, str) or not request.attempt_id:
+                raise AdapterDisabled("attempt_id_missing")
+            if request.authorization_id is None:
+                raise AdapterDisabled("authorization_id_missing")
+            if not isinstance(request.receiver, str) or not request.receiver:
+                raise AdapterDisabled("receiver_missing")
+            if request.receiver != self.endpoint:
+                # 实际端点必须与 prepared 行的 receiver 一致，否则视为跨任务替换。
+                raise AdapterDisabled("receiver_mismatch")
             if not isinstance(request_digest, str) or not request_digest:
                 raise AdapterDisabled("request_digest_missing")
             # 用不可变请求字节核对授权摘要：重算仅为比对，不当作新的授权摘要。
@@ -165,6 +176,9 @@ class WorkerAgentAdapter(AgentAdapter):
         if body_bytes is not None:
             # 直接把持久化授权摘要传给 worker；worker 发送前对不可变字节复核。
             job["request_digest"] = request_digest
+            # attempt_id 完整绑定到 worker job，worker 不自行生成替代 attempt_id。
+            job["attempt_id"] = request.attempt_id
+            job["authorization_id"] = request.authorization_id
         key = str(request.execution_id or request.idempotency_key or id(request))
         with Sandbox(self._spec()) as sandbox:
             with self._active_lock:

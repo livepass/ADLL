@@ -1,6 +1,6 @@
 # S9 IPC 与安全证据接口契约草案
 
-**日期**：2026-10-24（R2 定向修订；R3 补 §2.1/§5.1/§6.1；R4 补 §5.1 全字段签名 + §6.2）　**状态**：DRAFT（待审批；不改已批准 contracts/agent-adapter.md）
+**日期**：2026-10-24（R2 定向修订；R3 补 §2.1/§5.1/§6.1；R4 补 §5.1 全字段签名 + §6.2；R5 补 provider_request_id 签名覆盖）　**状态**：DRAFT（待审批；不改已批准 contracts/agent-adapter.md）
 **上位**：[s9-detailed-plan.md](./s9-detailed-plan.md)、[s9-isolation-architecture-decision.md](./s9-isolation-architecture-decision.md)
 
 本契约定义「FastAPI 宿主 ↔ 受保护启动器/Worker VM ↔ 固定出口」之间的最小接口与
@@ -144,6 +144,7 @@ SendReceipt {
 | `terminal_phase` | Egress | 终态判定（confirmed_sent / possibly_sent / not_sent），签名必须绑定，防止终态被改写 |
 | `http_status` | Egress | 上游 HTTP 状态；影响「是否确实已发送」的事实，必须签名覆盖 |
 | `raw_response_sha256` | Egress | 原始响应字节摘要；影响发送事实的证据，必须签名覆盖 |
+| `provider_request_id` | Egress | 服务商请求标识；影响发送事实关联与去重，必须签名覆盖 |
 | `policy_version` | Egress | 出口生效的转发/校验策略版本 |
 | `issuer` | 常量 `"egress"` | 签发者身份 |
 | `key_id` | Egress | 本次签名所用密钥标识（支持轮换） |

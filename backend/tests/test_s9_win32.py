@@ -1,4 +1,4 @@
-"""S9-1 离线安全实现测试：挂起创建、恢复前检查、纳管失败回收。
+"""S9-1 离线安全实现测试：挂起创建、恢复前强制身份检查、纳管失败回收。
 
 仅 Windows 运行（依赖真实受限令牌 + Job Object，但不依赖独立账户/VM）。
 真实 LogonUserW / 独立 TokenUser / VM 网络权限不在此判定，须在实际专用环境另行验收。
@@ -38,7 +38,7 @@ def _spec(root: Path) -> IsolationSpec:
 
 
 def test_suspended_spawn_and_pre_resume_check_then_resume(iso_root) -> None:
-    """挂起创建 → 恢复前复核身份 → resume → 进程正常运行。"""
+    """挂起创建 → 恢复前强制复核（批准 SID + restricting SID + Job）→ resume → 运行。"""
     with Sandbox(_spec(iso_root)) as sandbox:
         script = sandbox.work_dir / "echo.py"
         out = sandbox.work_dir / "done.txt"
@@ -57,14 +57,17 @@ def test_suspended_spawn_and_pre_resume_check_then_resume(iso_root) -> None:
             suspended=True,
         )
         try:
-            # 挂起时进程不应产出结果。
             assert not out.exists()
-            check = win32.pre_resume_check(process)
-            assert check.ok is True
+            # 批准的 TokenUser SID 即父进程当前用户 SID（本地受限令牌复用父令牌主体）。
+            check = win32.pre_resume_check(
+                process,
+                expected_token_user_sid=sandbox.parent_sid,
+                expected_restricting_sid=sandbox.restricting_sid,
+            )
+            assert check.ok is True, check.fail_reasons
             assert check.pid == process.pid
-            assert check.token_user_sid is not None
-            assert check.creation_time is not None
-            assert check.token_restricted is True
+            assert check.token_user_sid == sandbox.parent_sid
+            assert check.in_job is True
             assert sandbox.restricting_sid in check.restricting_sids
             process.resume()
             process.wait(30000)
@@ -74,8 +77,8 @@ def test_suspended_spawn_and_pre_resume_check_then_resume(iso_root) -> None:
             process.close()
 
 
-def test_pre_resume_check_reports_non_ok_evidence_and_caller_terminates(iso_root) -> None:
-    """复核证据不 ok 时调用方终止而非恢复（确定性负向路径）。"""
+def test_pre_resume_check_rejects_wrong_restricting_sid(iso_root) -> None:
+    """确定性负向：期望 restricting SID 与实际不符 → ok=False，须 terminate。"""
     with Sandbox(_spec(iso_root)) as sandbox:
         script = sandbox.work_dir / "sleep.py"
         script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
@@ -89,19 +92,69 @@ def test_pre_resume_check_reports_non_ok_evidence_and_caller_terminates(iso_root
         )
         pid = process.pid
         try:
-            check = win32.pre_resume_check(process)
-            # 正常受限进程应 ok；此处验证 ok 字段与证据齐全。真实身份不匹配
-            # （TokenUser 与批准 SID 不符）的负向须在专用账户环境实测，本地
-            # 受限令牌无法伪造 TokenUser 不匹配。
-            assert check.ok is True
-            assert check.token_user_sid is not None
-            assert check.creation_time is not None
-            # 模拟「复核失败」路径：调用方选择 terminate 而非 resume。
+            check = win32.pre_resume_check(
+                process,
+                expected_token_user_sid=sandbox.parent_sid,
+                expected_restricting_sid="S-1-5-21-9999999999-9999999999-9999999999-9999",
+            )
+            assert check.ok is False
+            assert "restricting_sid_mismatch" in check.fail_reasons
+            # 未通过检查 → 直接 resume 应被拒绝。
+            with pytest.raises(RuntimeError):
+                process.resume()
+            # 调用方必须 terminate + wait 而非只关闭句柄。
             process.job.terminate()
             process.wait(30000)
         finally:
             process.close()
         assert not win32.is_process_alive(pid)
+
+
+def test_resume_denied_without_passing_check(iso_root) -> None:
+    """确定性负向：未经检查通过，resume 必须拒绝（不静默放行）。"""
+    with Sandbox(_spec(iso_root)) as sandbox:
+        script = sandbox.work_dir / "sleep.py"
+        script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+        sandbox._allow_restricted_read(script)
+        process = win32.spawn_restricted(
+            [default_python(), "-I", str(script)],
+            cwd=sandbox.work_dir,
+            env=win32.build_environment(),
+            restricting_sid=sandbox.restricting_sid,
+            suspended=True,
+        )
+        try:
+            with pytest.raises(RuntimeError):
+                process.resume()
+        finally:
+            process.job.terminate()
+            process.close()
+
+
+def test_pre_resume_check_rejects_wrong_token_user(iso_root) -> None:
+    """确定性负向：期望 TokenUser SID 与实际不符 → ok=False。"""
+    with Sandbox(_spec(iso_root)) as sandbox:
+        script = sandbox.work_dir / "sleep.py"
+        script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+        sandbox._allow_restricted_read(script)
+        process = win32.spawn_restricted(
+            [default_python(), "-I", str(script)],
+            cwd=sandbox.work_dir,
+            env=win32.build_environment(),
+            restricting_sid=sandbox.restricting_sid,
+            suspended=True,
+        )
+        try:
+            check = win32.pre_resume_check(
+                process,
+                expected_token_user_sid="S-1-5-21-8888888888-8888888888-8888888888-8888",
+                expected_restricting_sid=sandbox.restricting_sid,
+            )
+            assert check.ok is False
+            assert "token_user_mismatch" in check.fail_reasons
+        finally:
+            process.job.terminate()
+            process.close()
 
 
 def test_job_assign_failure_terminates_process(iso_root, monkeypatch) -> None:
@@ -111,7 +164,6 @@ def test_job_assign_failure_terminates_process(iso_root, monkeypatch) -> None:
         script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
         sandbox._allow_restricted_read(script)
 
-        # 强制 assign 失败，验证 terminate 分支被走到。
         def fake_assign(self, handle):
             raise OSError("simulated assign failure")
 
@@ -146,7 +198,6 @@ def test_suspended_spawn_requires_explicit_resume(iso_root) -> None:
 
             time.sleep(0.5)
             assert not marker.exists()
-            # 未 resume 时 wait 会超时并终止；直接清理。
         finally:
             process.job.terminate()
             process.close()

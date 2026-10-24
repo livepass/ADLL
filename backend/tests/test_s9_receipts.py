@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
+
 from app.models.base import utcnow
 from app.models.outbound import (
     OutboundAuthorization,
@@ -167,6 +169,7 @@ def test_expired_receipt_rejected(app) -> None:
             "terminal_phase": "confirmed_sent",
             "http_status": 200,
             "raw_response_sha256": "r" * 64,
+            "provider_request_id": None,
             "policy_version": "v1",
             "issuer": "egress",
             "key_id": KEY_ID,
@@ -268,6 +271,7 @@ def test_late_receipt_expired_not_appended(app) -> None:
             "terminal_phase": "confirmed_sent",
             "http_status": 200,
             "raw_response_sha256": "r" * 64,
+            "provider_request_id": None,
             "policy_version": "v1",
             "issuer": "egress",
             "key_id": KEY_ID,
@@ -317,5 +321,126 @@ def test_append_receipt_evidence_is_append_only(app) -> None:
         append_receipt_evidence(db, attempt_id=prepared.attempt_id, kind="late_receipt", receipt={"attempt_id": prepared.attempt_id}, verification="verified")
         append_receipt_evidence(db, attempt_id=prepared.attempt_id, kind="late_receipt", receipt={"attempt_id": prepared.attempt_id}, verification="verified")
         assert db.query(SendReceiptEvidence).filter_by(attempt_id=prepared.attempt_id).count() == 2
+    finally:
+        db.close()
+
+
+def test_late_receipt_idempotent_on_duplicate(app) -> None:
+    """同一迟到收据重复提交幂等：不产生重复可信证据。"""
+    db = _db(app)
+    try:
+        prepared = _prepared(db, attempt_id="dup1")
+        finish_attempt(db, prepared.attempt_id, phase="possibly_sent", error_code="restart_unconfirmed")
+        receipt = _receipt(prepared)
+
+        first = record_late_receipt(db, receipt=receipt, key=KEY, prepared=prepared)
+        assert first.ok is True and first.reason == "late_receipt_appended"
+
+        second = record_late_receipt(db, receipt=receipt, key=KEY, prepared=prepared)
+        assert second.ok is True and second.reason == "late_receipt_already_recorded"
+
+        assert db.query(SendReceiptEvidence).filter_by(attempt_id=prepared.attempt_id, kind="late_receipt").count() == 1
+    finally:
+        db.close()
+
+
+def test_provider_request_id_tamper_rejected(app) -> None:
+    """provider_request_id 纳入签名：篡改后验签失败。"""
+    db = _db(app)
+    try:
+        prepared = _prepared(db)
+        receipt = _receipt(prepared, provider_request_id="req-123")
+        # 篡改 provider_request_id（签名未覆盖到新值）→ 验签失败。
+        tampered = SendReceipt(
+            **{**receipt.to_dict(), "provider_request_id": "req-EVIL"}
+        )
+        result = verify_send_receipt(tampered, key=KEY, prepared=prepared)
+        assert result.ok is False and result.code == "signature_invalid"
+    finally:
+        db.close()
+
+
+def test_issued_at_in_future_rejected(app) -> None:
+    """签发时间不能晚于当前（防未来时间戳回填）。"""
+    db = _db(app)
+    try:
+        prepared = _prepared(db)
+        future = (utcnow() + timedelta(hours=1)).isoformat()
+        values = {
+            "attempt_id": prepared.attempt_id,
+            "authorization_id": prepared.authorization_id,
+            "receiver": prepared.receiver,
+            "request_digest": prepared.request_digest,
+            "actual_body_sha256": prepared.request_digest,
+            "terminal_phase": "confirmed_sent",
+            "http_status": 200,
+            "raw_response_sha256": "r" * 64,
+            "provider_request_id": None,
+            "policy_version": "v1",
+            "issuer": "egress",
+            "key_id": KEY_ID,
+            "issued_at": future,
+            "expires_at": future,
+        }
+        sig = receipts.sign(receipts.SEND_RECEIPT_SIGNED_FIELDS, values, KEY)
+        fut = SendReceipt(
+            attempt_id=prepared.attempt_id,
+            authorization_id=prepared.authorization_id,
+            receiver=prepared.receiver,
+            request_digest=prepared.request_digest,
+            actual_body_sha256=prepared.request_digest,
+            terminal_phase="confirmed_sent",
+            http_status=200,
+            raw_response_sha256="r" * 64,
+            policy_version="v1",
+            issuer="egress",
+            key_id=KEY_ID,
+            issued_at=future,
+            expires_at=future,
+            signature=sig,
+        )
+        result = verify_send_receipt(fut, key=KEY, prepared=prepared)
+        assert result.ok is False and result.code == "issued_at_invalid"
+    finally:
+        db.close()
+
+
+def test_policy_version_mismatch_rejected(app) -> None:
+    """策略版本与宿主预期不一致 → 拒绝。"""
+    db = _db(app)
+    try:
+        prepared = _prepared(db)
+        receipt = _receipt(prepared)
+        result = verify_send_receipt(receipt, key=KEY, prepared=prepared, expected_policy_version="v2")
+        assert result.ok is False and result.code == "policy_version_mismatch"
+    finally:
+        db.close()
+
+
+def test_receipt_evidence_forbids_update_and_delete(app) -> None:
+    """数据库级 UPDATE/DELETE 禁止：触发器阻断改写/删除证据。"""
+    from sqlalchemy.exc import IntegrityError
+
+    db = _db(app)
+    try:
+        prepared = _prepared(db, attempt_id="immut1")
+        row = append_receipt_evidence(
+            db, attempt_id=prepared.attempt_id, kind="late_receipt",
+            receipt={"attempt_id": prepared.attempt_id}, verification="verified",
+        )
+        # UPDATE 应被触发器拒绝。
+        with pytest.raises(IntegrityError):
+            db.query(SendReceiptEvidence).filter_by(id=row.id).update({"verification": "forged"})
+            db.commit()
+        db.rollback()
+        # DELETE 应被触发器拒绝。
+        with pytest.raises(IntegrityError):
+            db.query(SendReceiptEvidence).filter_by(id=row.id).delete()
+            db.commit()
+        db.rollback()
+        # 记录仍在且未被改写。
+        db.expire_all()
+        kept = db.get(SendReceiptEvidence, row.id)
+        assert kept is not None and kept.verification == "verified"
     finally:
         db.close()

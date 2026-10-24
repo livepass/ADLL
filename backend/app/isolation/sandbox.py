@@ -453,6 +453,11 @@ class Sandbox:
         env_extra: dict[str, str] | None = None,
         body_bytes: bytes | None = None,
     ) -> dict:
+        # 注意（S9-1 接线状态）：当前生产路径仍以 `suspended=False`（非挂起）
+        # 启动 worker——`spawn_restricted(..., suspended=True)` + `pre_resume_check`
+        # 是 S9-1 新增的接口，尚未接线到此生产路径。挂起创建 + 强制恢复前身份
+        # 复核需依赖独立账户 LogonUserW（BLOCKED，待专用环境）才能作为真实门禁；
+        # 在此之前，不得把挂起创建接口宣称为生产安全门禁。
         if self._script_tampered(self.worker_script, self.worker_script_sha256):
             return {"ok": False, "error": "script_tampered", "sent": False}
         job_path = self.work_dir / "job.json"
