@@ -12,6 +12,11 @@ export interface GateInput {
   taskId: number
   authorizationId: number
   feedback: string[]
+  /**
+   * 当前正式需求内容。需求属于实际发送内容（payload 的 requirement 字段），
+   * 缺失它会让「需求已变更但旧预览仍可确认」的漏洞成立。
+   */
+  requirement?: string
 }
 
 /** 反馈输入按行拆分，空行丢弃；与后端发送口径保持一致。 */
@@ -28,6 +33,7 @@ export function requestFingerprint(input: GateInput): string {
     taskId: input.taskId,
     authorizationId: input.authorizationId,
     feedback: input.feedback,
+    requirement: input.requirement ?? '',
   })
 }
 

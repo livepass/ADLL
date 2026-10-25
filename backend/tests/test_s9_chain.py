@@ -966,3 +966,94 @@ def test_settle_no_revocation_evidence_when_authorization_active(app) -> None:
         assert races == []
     finally:
         db.close()
+
+
+def test_settle_fails_closed_when_authorization_missing(app, monkeypatch) -> None:
+    """授权记录缺失 → 不得升格 confirmed_sent（fail-closed，不因「无撤销记录」放行）。"""
+    from app.models.outbound import OutboundAuthorization
+
+    db = _db(app)
+    try:
+        prepared = _prepared(db, attempt_id="auth_missing", auth_id=71)
+        host, launcher, egress = _chain(db)
+        request = host.build_request_from_db(
+            db, attempt_id=prepared.attempt_id,
+            body=canonical_payload_bytes(PAYLOAD), model="m",
+        )
+        outcome = launcher.dispatch(request, egress)
+        assert outcome.phase == "confirmed_sent"
+
+        # 模拟「授权记录缺失」：不影响外键引用，仅让 settle 查不到授权。
+        original_get = db.get
+
+        def fake_get(model, pk, **kwargs):
+            if model is OutboundAuthorization:
+                return None
+            return original_get(model, pk, **kwargs)
+
+        monkeypatch.setattr(db, "get", fake_get)
+
+        verification, appended = host.settle(
+            db, outcome=outcome, prepared=prepared, egress_key=EGRESS_KEY
+        )
+        assert verification.ok is False
+        assert verification.code == "authorization_missing"
+        assert appended is False
+        terminals = (
+            db.query(SendAuditRecord)
+            .filter(SendAuditRecord.attempt_id == prepared.attempt_id,
+                    SendAuditRecord.phase != "prepared")
+            .all()
+        )
+        assert len(terminals) == 1
+        assert terminals[0].phase == "possibly_sent"
+        assert terminals[0].error_code == "authorization_missing"
+    finally:
+        db.close()
+
+
+def test_settle_fails_closed_when_issued_at_unparseable(app) -> None:
+    """收据签发时间不可解析 → 无法判定时序 → 不得升格 confirmed_sent。"""
+    db = _db(app)
+    try:
+        prepared = _prepared(db, attempt_id="bad_issued", auth_id=72)
+        host, launcher, egress = _chain(db)
+        request = host.build_request_from_db(
+            db, attempt_id=prepared.attempt_id,
+            body=canonical_payload_bytes(PAYLOAD), model="m",
+        )
+        outcome = launcher.dispatch(request, egress)
+        # 构造一个 issued_at 不可解析但其余字段仍能通过验签的收据：
+        # 直接用同一签名（签名在 issued_at 被篡改后会失败），因此这里改走
+        # 「授权被撤销且 issued_at 非法」的判定分支需真实签名 —— 用 issue 重签。
+        bad = receipts.issue_send_receipt(
+            attempt_id=prepared.attempt_id,
+            authorization_id=prepared.authorization_id,
+            receiver=prepared.receiver,
+            request_digest=prepared.request_digest,
+            actual_body_sha256=prepared.request_digest,
+            terminal_phase="confirmed_sent",
+            http_status=200,
+            raw_response_sha256="r" * 64,
+            policy_version=s9_chain.DEFAULT_POLICY_VERSION,
+            key_id="egress-k1",
+            key=EGRESS_KEY,
+        )
+        object.__setattr__(bad, "issued_at", "not-a-timestamp")
+        outcome.receipt = bad
+        verification, _ = host.settle(
+            db, outcome=outcome, prepared=prepared, egress_key=EGRESS_KEY
+        )
+        # 签名覆盖 issued_at，篡改后应先被签名校验拒绝；无论哪一层，
+        # 结果都不得是 confirmed_sent。
+        assert verification.ok is False
+        terminals = (
+            db.query(SendAuditRecord)
+            .filter(SendAuditRecord.attempt_id == prepared.attempt_id,
+                    SendAuditRecord.phase != "prepared")
+            .all()
+        )
+        assert len(terminals) == 1
+        assert terminals[0].phase != "confirmed_sent"
+    finally:
+        db.close()

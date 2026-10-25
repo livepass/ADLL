@@ -354,6 +354,10 @@ def _prepare(
             raise GenerationBlocked("preview_required")
         if expected_digest != prepared.request_digest:
             raise GenerationBlocked("preview_digest_mismatch")
+    elif expected_digest is not None and expected_digest != prepared.request_digest:
+        # 测试模式允许「未提供摘要」以便自动化直接调用，但**一旦提供就必须匹配**：
+        # 忽略客户端给出的摘要会让过期/错误的预览静默通过，与预览门禁的语义相悖。
+        raise GenerationBlocked("preview_digest_mismatch")
     return prepared, isolation
 
 

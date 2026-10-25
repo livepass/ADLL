@@ -33,6 +33,40 @@ describe('previewGate', () => {
     expect(feedbackLines('   ')).toEqual([])
   })
 
+  it('fingerprint changes when the formal requirement content changes', () => {
+    // 需求内容属于实际发送正文；变更后旧预览不得继续可确认。
+    const base = requestFingerprint({
+      taskId: 1,
+      authorizationId: 2,
+      feedback: [],
+      requirement: 'V1 需求',
+    })
+    expect(
+      requestFingerprint({ taskId: 1, authorizationId: 2, feedback: [], requirement: 'V1 需求' }),
+    ).toBe(base)
+    expect(
+      requestFingerprint({ taskId: 1, authorizationId: 2, feedback: [], requirement: 'V2 需求' }),
+    ).not.toBe(base)
+  })
+
+  it('preview becomes stale after the requirement content changes', () => {
+    const input = ref({
+      taskId: 1,
+      authorizationId: 2,
+      feedback: [] as string[],
+      requirement: 'V1 需求',
+    })
+    const gate = usePreviewGate(() => input.value)
+    expect(loadOnce(gate)).toBe(true)
+    expect(gate.fresh.value).toBe(true)
+
+    input.value = { ...input.value, requirement: 'V2 需求' }
+    expect(gate.fresh.value).toBe(false)
+    expect(gate.dirty.value).toBe(true)
+    expect(gate.digest.value).toBeNull()
+    expect(() => gate.consume()).toThrowError('preview_stale')
+  })
+
   it('fingerprint changes with task, authorization or feedback', () => {
     const base = requestFingerprint({ taskId: 1, authorizationId: 2, feedback: [] })
     expect(requestFingerprint({ taskId: 1, authorizationId: 2, feedback: [] })).toBe(base)

@@ -24,7 +24,12 @@ class MockAgentAdapter(AgentAdapter):
             raise RuntimeError("mock adapter failure (synthetic)")
         if sink is not None:
             sink.emit({"type": "start"})
+        # 合成内容必须显式标注；反馈必须体现在输出中，否则「意见 → 新版本」闭环失效
+        # （v2 会与 v1 完全一致，content_hash 相同）。反馈是宿主逐条传入的文本。
         text = "MOCK_PLAN: " + (request.requirement_text or "")
+        if request.feedback_texts:
+            lines = "\n".join(f"- {item}" for item in request.feedback_texts)
+            text = f"{text}\n\nMOCK_FEEDBACK_APPLIED（合成，非真实模型）:\n{lines}"
         if sink is not None:
             sink.emit({"type": "delta", "text": text})
         return GenerationResult(

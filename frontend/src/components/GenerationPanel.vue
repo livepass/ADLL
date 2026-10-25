@@ -188,6 +188,8 @@ const gate = usePreviewGate(() => ({
   taskId: props.taskId,
   authorizationId: activeAuthorization.value?.id ?? -1,
   feedback: feedbackLines(feedbackText.value),
+  // 需求内容参与指纹：需求变更后旧预览必须失效，不能凭旧摘要确认发送。
+  requirement: props.requirementContent,
 }))
 // 顶层 ref 才能在模板里自动解包。
 const preview = gate.preview

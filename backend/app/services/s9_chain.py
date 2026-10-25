@@ -720,15 +720,16 @@ class HostGateway:
 
         auth = db.get(OutboundAuthorization, prepared.authorization_id)
         race = _revocation_race(auth, outcome.receipt)
-        if race == "revoked_before_issue":
-            # 撤销早于（或等于）签发 → 该收据不得升格为 confirmed_sent。
+        # fail-closed：以下情况都无法证明「签发时授权有效」，一律不得升格
+        # confirmed_sent。缺授权记录（authorization_missing）与签发时间不可解析
+        # （issued_at_invalid）同样必须拒绝，不能因为没有撤销记录就默认放行。
+        if race in ("revoked_before_issue", "authorization_missing", "issued_at_invalid"):
             if not receipts.has_terminal(db, outcome.attempt_id):
                 outbound.finish_attempt(
-                    db, outcome.attempt_id, phase="possibly_sent",
-                    error_code="revoked_before_issue",
+                    db, outcome.attempt_id, phase="possibly_sent", error_code=race
                 )
-            _record_evidence(db, outcome, "revocation_race", "revoked_before_issue")
-            return receipts.ReceiptVerification(False, "revoked_before_issue"), False
+            _record_evidence(db, outcome, "revocation_race", race)
+            return receipts.ReceiptVerification(False, race), False
         if race == "revoked_after_issue":
             # 签发时授权仍有效，之后才被撤销：收据有效，但留证以便审计追溯。
             _record_evidence(db, outcome, "revocation_after_issue", "recorded")

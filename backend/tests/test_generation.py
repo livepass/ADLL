@@ -453,3 +453,41 @@ def test_production_rejects_stale_preview_digest(tmp_path, app_factory) -> None:
         assert calls == []
     finally:
         db.close()
+
+
+def test_testing_mode_rejects_stale_preview_digest(tmp_path, app_factory) -> None:
+    """测试模式允许不传摘要，但**一旦提供就必须匹配**（不得静默忽略）。"""
+    app, _client, _csrf, repo, task, auth_id = _setup(tmp_path, app_factory)
+    db, task_obj, auth = _objects(app, task["id"], auth_id)
+    calls = []
+    try:
+        with pytest.raises(GenerationBlocked) as exc:
+            _start(
+                db, task_obj, auth, repo, _adapter(_ok_transport(calls)),
+                testing=True, preview_digest="0" * 64,
+            )
+        assert exc.value.code == "preview_digest_mismatch"
+        assert calls == []
+        assert db.query(GenerationExecution).count() == 0
+    finally:
+        db.close()
+
+
+def test_testing_mode_allows_matching_preview_digest(tmp_path, app_factory) -> None:
+    """测试模式提供**正确**摘要时正常放行（不误伤既有自动化路径）。"""
+    app, _client, _csrf, repo, task, auth_id = _setup(tmp_path, app_factory)
+    db, task_obj, auth = _objects(app, task["id"], auth_id)
+    calls = []
+    try:
+        _start(
+            db, task_obj, auth, repo, _adapter(_ok_transport(calls)),
+            testing=True,
+        )
+        latest = (
+            db.query(GenerationExecution)
+            .order_by(GenerationExecution.id.desc())
+            .first()
+        )
+        assert latest is not None and latest.status == "completed"
+    finally:
+        db.close()

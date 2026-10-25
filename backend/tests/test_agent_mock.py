@@ -57,3 +57,34 @@ def test_mock_via_http(client, auth) -> None:
     assert body["text"].startswith("MOCK_PLAN:")
     assert body["tool_call_log"] == []
     assert body["terminal_status"] == "completed"
+
+def test_mock_applies_feedback_to_output() -> None:
+    """反馈必须体现在合成输出中，否则「意见 → 新版本」闭环失效（v2 会等于 v1）。"""
+    adapter = MockAgentAdapter()
+    base = adapter.generate(
+        GenerationRequest(subset_path=None, requirement_text="需求X")
+    )
+    with_feedback = adapter.generate(
+        GenerationRequest(
+            subset_path=None,
+            requirement_text="需求X",
+            feedback_texts=["改为多参数求和", "补充边界值测试"],
+        )
+    )
+    # 必须明显不同（否则 content_hash 相同，v2 与 v1 无法区分）。
+    assert with_feedback.text != base.text
+    assert "MOCK_FEEDBACK_APPLIED" in with_feedback.text
+    assert "改为多参数求和" in with_feedback.text
+    assert "补充边界值测试" in with_feedback.text
+    # 仍保留合成标识，不得伪装成真实模型输出。
+    assert with_feedback.text.startswith("MOCK_PLAN: ")
+    assert with_feedback.send_evidence["transport"] == "mock"
+
+
+def test_mock_without_feedback_unchanged() -> None:
+    """无反馈时输出保持原格式（不破坏既有调用方与基线对比）。"""
+    adapter = MockAgentAdapter()
+    result = adapter.generate(
+        GenerationRequest(subset_path=None, requirement_text="需求Y")
+    )
+    assert result.text == "MOCK_PLAN: 需求Y"
