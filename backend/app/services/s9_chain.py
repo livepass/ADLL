@@ -21,7 +21,7 @@ import multiprocessing as mp
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy.exc import IntegrityError
 
@@ -58,6 +58,8 @@ class AuthorizationRequest:
     nonce: str
     policy_version: str
     host_receipt: HostAuthorizationReceipt | None = None
+    # Launcher 在转发前签发；Egress 用它认证调用者（问题 B）。
+    launcher_auth: receipts.LauncherAuth | None = None
 
 
 @dataclass
@@ -137,7 +139,13 @@ class SyntheticProvider:
 
 @dataclass
 class EgressRelay:
-    """应用层受控出口：只接受固定 Messages POST，签发结构化收据。"""
+    """应用层受控出口：只接受固定 Messages POST，签发结构化收据。
+
+    放行条件是**两道独立凭证**（问题 B）：
+    1. 调用者认证：`launcher_auth` 用已登记的 Launcher 密钥验签（未配置即拒绝）；
+    2. 宿主授权：`host_receipt` 用宿主公钥验签，且 approved/未过期/字段一致。
+    仅凭 receiver + request_digest + policy_version 不足以放行。
+    """
 
     signing_key: bytes
     key_id: str
@@ -145,6 +153,11 @@ class EgressRelay:
     provider: SyntheticProvider = field(default_factory=SyntheticProvider)
     replay: ReplayStore | None = None
     receipt_ttl_seconds: int = 300
+    # 调用者（Launcher）公钥集合：key_id → key；空表示未配置 → fail-closed。
+    launcher_keys: dict[str, bytes] = field(default_factory=dict)
+    # 宿主公钥：用于验证 host_receipt；None 表示未配置 → fail-closed。
+    host_public_key: bytes | None = None
+    allowed_policy_versions: tuple[str, ...] = (DEFAULT_POLICY_VERSION,)
 
     def forward(
         self,
@@ -155,19 +168,23 @@ class EgressRelay:
         # 1) 固定端点 + 固定路径：不具备通用代理能力。
         if not _is_fixed_messages_endpoint(request.receiver):
             raise ChainDenied("egress_endpoint_not_allowed")
-        # 2) 实际字节摘要必须与授权摘要一致（三方核对第二跳）。
+        # 2) 调用者认证：必须来自被授权的 Launcher，而不是任意本地进程。
+        self._authenticate_caller(request, now=now)
+        # 3) 宿主授权凭证：Egress 独立验证，不依赖 Launcher 的结论。
+        self._verify_host_grant(request, now=now)
+        # 4) 实际字节摘要必须与授权摘要一致（三方核对第二跳）。
         actual = hashlib.sha256(request.body).hexdigest()
         if actual != request.request_digest:
             raise ChainDenied("egress_body_digest_mismatch")
         if request.policy_version != self.policy_version:
             raise ChainDenied("egress_policy_version_mismatch")
-        # 3) 持久化单次处理：重复 attempt 直接拒绝，不转发第二次。
+        # 5) 持久化单次处理：重复 attempt 直接拒绝，不转发第二次。
         if self.replay is not None and not self.replay.register(
             "egress", request.attempt_id, request.nonce
         ):
             raise ChainDenied("egress_replayed_attempt")
 
-        # 4) 进入发送阶段：此后任何异常都不得断言「未发送」。
+        # 6) 进入发送阶段：此后任何异常都不得断言「未发送」。
         try:
             response = self.provider.send(request.body, timeout_ms=request.timeout_ms)
         except TimeoutError:
@@ -187,6 +204,51 @@ class EgressRelay:
             None,
             provider_request_id=response.get("provider_request_id"),
         )
+
+    def _authenticate_caller(
+        self, request: AuthorizationRequest, *, now: datetime | None
+    ) -> None:
+        if not self.launcher_keys:
+            # 未登记任何 Launcher 密钥 → 不发放，绝不降级为「无认证放行」。
+            raise ChainDenied("egress_caller_auth_not_configured")
+        auth = request.launcher_auth
+        if auth is None:
+            raise ChainDenied("launcher_auth_missing")
+        key = self.launcher_keys.get(auth.key_id)
+        if key is None:
+            raise ChainDenied("launcher_key_unknown")
+        verification = receipts.verify_launcher_auth(
+            auth,
+            key=key,
+            attempt_id=request.attempt_id,
+            request_digest=request.request_digest,
+            nonce=request.nonce,
+            now=now,
+        )
+        if not verification.ok:
+            raise ChainDenied(f"launcher_auth_{verification.code}")
+
+    def _verify_host_grant(
+        self, request: AuthorizationRequest, *, now: datetime | None
+    ) -> None:
+        if self.host_public_key is None:
+            raise ChainDenied("egress_host_key_not_configured")
+        if request.host_receipt is None:
+            raise ChainDenied("egress_host_receipt_missing")
+        actual = hashlib.sha256(request.body).hexdigest()
+        verification = receipts.verify_host_receipt_against_request(
+            request.host_receipt,
+            key=self.host_public_key,
+            attempt_id=request.attempt_id,
+            authorization_id=request.authorization_id,
+            receiver=request.receiver,
+            request_digest=request.request_digest,
+            body_sha256=actual,
+            now=now,
+            allowed_policy_versions=self.allowed_policy_versions,
+        )
+        if not verification.ok:
+            raise ChainDenied(f"egress_host_receipt_{verification.code}")
 
     def _receipt(
         self,
@@ -264,24 +326,33 @@ class ProcessTransport(ChainTransport):
     - 主进程被杀时子进程可被 terminate，不遗留发送。
     """
 
-    database_url: str
-    egress_signing_key: bytes
-    egress_key_id: str
+    # Egress 自己的 replay 库（独立文件）：子进程**不打开审批数据库**（问题 D）。
+    egress_replay_url: str = ""
+    egress_signing_key: bytes = b""
+    egress_key_id: str = ""
     policy_version: str = DEFAULT_POLICY_VERSION
     provider_fail_mode: str = "ok"
     timeout_seconds: float = 60.0
-    # 最近一次转发的子进程 PID（供证据/测试断言「确实跨进程」）。
+    # 子进程 Egress 需要这两组公钥来认证调用者与验证宿主授权（问题 B）。
+    launcher_keys: dict[str, bytes] = field(default_factory=dict)
+    host_public_key: bytes | None = None
+    # 证据：最近一次转发的子进程 PID / 它在自己的库里看到的表（问题 D）。
     last_child_pid: int | None = field(default=None, init=False, repr=False)
+    last_child_tables: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def forward(self, request: AuthorizationRequest, *, now: datetime | None = None) -> SendReceipt:
+        if not self.egress_replay_url:
+            raise ChainDenied("egress_replay_store_not_configured")
         ctx = mp.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         config = {
-            "database_url": self.database_url,
+            "replay_url": self.egress_replay_url,
             "signing_key": self.egress_signing_key,
             "key_id": self.egress_key_id,
             "policy_version": self.policy_version,
             "fail_mode": self.provider_fail_mode,
+            "launcher_keys": dict(self.launcher_keys),
+            "host_public_key": self.host_public_key,
         }
         process = ctx.Process(
             target=_egress_process_main,
@@ -306,6 +377,7 @@ class ProcessTransport(ChainTransport):
         if message.get("error"):
             raise RuntimeError(f"egress_process_error:{message['error']}")
         self.last_child_pid = message.get("pid")
+        self.last_child_tables = tuple(message.get("tables") or ())
         return SendReceipt.from_dict(message["receipt"])
 
 
@@ -321,11 +393,13 @@ def _request_to_wire(request: AuthorizationRequest) -> dict:
         "nonce": request.nonce,
         "policy_version": request.policy_version,
         "host_receipt": request.host_receipt.to_dict() if request.host_receipt else None,
+        "launcher_auth": request.launcher_auth.to_dict() if request.launcher_auth else None,
     }
 
 
 def _request_from_wire(data: dict) -> AuthorizationRequest:
     host = data.get("host_receipt")
+    launcher_auth = data.get("launcher_auth")
     return AuthorizationRequest(
         attempt_id=data["attempt_id"],
         authorization_id=int(data["authorization_id"]),
@@ -337,21 +411,28 @@ def _request_from_wire(data: dict) -> AuthorizationRequest:
         nonce=data["nonce"],
         policy_version=data["policy_version"],
         host_receipt=HostAuthorizationReceipt(**host) if host else None,
+        launcher_auth=receipts.LauncherAuth(**launcher_auth) if launcher_auth else None,
     )
 
 
 def _egress_process_main(conn, config: dict, request_wire: dict) -> None:
     """子进程入口（模块级，spawn 可 pickle）。
 
-    子进程自带 DB 连接与 replay store；不复用父进程 session。
-    回传 `pid` 作为「确实在独立进程执行」的可核验证据。
+    子进程只打开**自己的 replay 库**（`replay_url`），并只创建 replay 表；
+    它不持有审批数据库路径，因此结构上无法读取审批记录（问题 D）。
+    回传 `pid` 与 `tables` 作为可核验证据。
     """
     import os as _os
+
+    from sqlalchemy import inspect as _inspect
 
     from ..db import Database
 
     pid = _os.getpid()
-    database = Database(config["database_url"])
+    database = Database(config["replay_url"])
+    # 只建 replay 表，避免把完整审批 schema 复制进 Egress 的库。
+    S9ReplayGuard.__table__.create(database.engine, checkfirst=True)
+    tables = tuple(sorted(_inspect(database.engine).get_table_names()))
     db = database.session()
     try:
         egress = EgressRelay(
@@ -360,14 +441,16 @@ def _egress_process_main(conn, config: dict, request_wire: dict) -> None:
             policy_version=config["policy_version"],
             provider=SyntheticProvider(fail_mode=config["fail_mode"]),
             replay=DbReplayStore(db),
+            launcher_keys=config.get("launcher_keys") or {},
+            host_public_key=config.get("host_public_key"),
         )
         try:
             receipt = egress.forward(_request_from_wire(request_wire))
-            conn.send({"receipt": receipt.to_dict(), "pid": pid})
+            conn.send({"receipt": receipt.to_dict(), "pid": pid, "tables": list(tables)})
         except ChainDenied as exc:
-            conn.send({"denied": True, "code": exc.code, "pid": pid})
+            conn.send({"denied": True, "code": exc.code, "pid": pid, "tables": list(tables)})
         except Exception as exc:  # noqa: BLE001 — 子进程异常如实回传
-            conn.send({"error": type(exc).__name__, "pid": pid})
+            conn.send({"error": type(exc).__name__, "pid": pid, "tables": list(tables)})
     finally:
         try:
             conn.close()
@@ -385,6 +468,10 @@ class Launcher:
     host_public_key: bytes
     allowed_policy_versions: tuple[str, ...] = (DEFAULT_POLICY_VERSION,)
     replay: ReplayStore | None = None
+    # 调用者密钥：用于向 Egress 证明「我是被授权的 Launcher」（问题 B）。
+    launcher_key: bytes | None = None
+    launcher_key_id: str = "launcher-k1"
+    launcher_auth_ttl_seconds: int = 120
 
     def dispatch(
         self,
@@ -430,6 +517,17 @@ class Launcher:
 
         # 4) 交给固定出口（进程内或独立进程）。语义：拒绝发生在转发前 → not_sent；
         #    转发阶段异常 → possibly_sent；**任何情况都不自动重发**。
+        #    转发前先签发调用者凭证，使 Egress 能认证本次调用来自被授权的 Launcher。
+        if self.launcher_key is None:
+            raise ChainDenied("launcher_key_not_configured")
+        request.launcher_auth = receipts.issue_launcher_auth(
+            attempt_id=request.attempt_id,
+            request_digest=request.request_digest,
+            nonce=request.nonce,
+            key_id=self.launcher_key_id,
+            key=self.launcher_key,
+            ttl_seconds=self.launcher_auth_ttl_seconds,
+        )
         transport = (
             egress if isinstance(egress, ChainTransport) else InProcessTransport(egress)
         )
@@ -533,13 +631,19 @@ class HostGateway:
         model: str,
         timeout_ms: int = 30000,
         nonce: str | None = None,
+        now: datetime | None = None,
     ) -> AuthorizationRequest:
-        """严格版：attempt_id 必须命中**数据库已持久化的 prepared 行**。
+        """严格版：attempt 必须命中已持久化 prepared 行，且授权仍有效。
 
-        与 `build_request` 的区别：不接受调用方传入的 duck-typed 对象，避免用
-        伪造的 prepared 对象凭空生成宿主授权收据。
+        三重校验，任一失败即拒绝签发宿主授权收据：
+        1. `SendAuditRecord(attempt_id, phase="prepared")` 存在；
+        2. 其 `authorization_id` 对应的 `OutboundAuthorization` 存在；
+        3. 该授权**当前有效**（未撤销、已批准、未过期）且 receiver 与 prepared 行一致。
+
+        授权可能在 prepared 之后被撤销，故此处按调用时刻重新判定（fail-closed）。
         """
-        from ..models.outbound import SendAuditRecord
+        from ..models.outbound import OutboundAuthorization, SendAuditRecord
+        from . import outbound as outbound_service
 
         prepared = (
             db.query(SendAuditRecord)
@@ -548,6 +652,19 @@ class HostGateway:
         )
         if prepared is None:
             raise ChainDenied("prepared_row_missing")
+
+        auth = db.get(OutboundAuthorization, prepared.authorization_id)
+        if auth is None:
+            raise ChainDenied("authorization_missing")
+        reason = outbound_service.inactive_reason(auth, now)
+        if reason is not None:
+            # revoked / not_approved / expired / no_authorization
+            raise ChainDenied(f"authorization_{reason}")
+        if auth.receiver != prepared.receiver:
+            raise ChainDenied("authorization_receiver_mismatch")
+        if not auth.task_id or not auth.baseline_id:
+            raise ChainDenied("authorization_unverifiable")
+
         return self.build_request(
             prepared=prepared,
             body=body,
@@ -597,10 +714,75 @@ class HostGateway:
             )
             return late, True
 
+        # 契约 §6.2：撤销与签发的时序边界。
+        # 宿主依「撤销时间 vs 收据签发时间」判定，不依赖 Egress 自证。
+        from ..models.outbound import OutboundAuthorization
+
+        auth = db.get(OutboundAuthorization, prepared.authorization_id)
+        race = _revocation_race(auth, outcome.receipt)
+        if race == "revoked_before_issue":
+            # 撤销早于（或等于）签发 → 该收据不得升格为 confirmed_sent。
+            if not receipts.has_terminal(db, outcome.attempt_id):
+                outbound.finish_attempt(
+                    db, outcome.attempt_id, phase="possibly_sent",
+                    error_code="revoked_before_issue",
+                )
+            _record_evidence(db, outcome, "revocation_race", "revoked_before_issue")
+            return receipts.ReceiptVerification(False, "revoked_before_issue"), False
+        if race == "revoked_after_issue":
+            # 签发时授权仍有效，之后才被撤销：收据有效，但留证以便审计追溯。
+            _record_evidence(db, outcome, "revocation_after_issue", "recorded")
+
         outbound.finish_attempt(
             db, outcome.attempt_id, phase=outcome.receipt.terminal_phase
         )
         return verification, False
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone(UTC).replace(tzinfo=None)
+    return value
+
+
+def _revocation_race(auth, receipt: SendReceipt) -> str | None:
+    """契约 §6.2：授权撤销与收据签发的时间边界判定。
+
+    - `None`：未撤销，或无法判定（授权缺失时返回 authorization_missing）。
+    - `revoked_before_issue`：撤销时间 ≤ 签发时间 → 收据虽签名有效，但签发落在撤销之后/同时，
+      不得升格 `confirmed_sent`。
+    - `revoked_after_issue`：签发时仍有效、之后才撤销 → 收据有效，仅留证。
+
+    这是**竞态窗口的显式声明**：收据 TTL 内发生的撤销无法阻断已签发的发送，
+    但必须可按时间戳判定归属，而不是事后静默接受。
+    """
+    if auth is None:
+        return "authorization_missing"
+    revoked = getattr(auth, "revoked_at", None)
+    if revoked is None:
+        return None
+    issued = receipts._parse_iso(receipt.issued_at)
+    if issued is None:
+        return "issued_at_invalid"
+    if _naive_utc(revoked) <= _naive_utc(issued):
+        return "revoked_before_issue"
+    return "revoked_after_issue"
+
+
+def _record_evidence(db, outcome: ChainOutcome, kind: str, verification: str) -> None:
+    """追加撤销竞态证据；重复写入按唯一索引幂等忽略。"""
+    if outcome.receipt is None:
+        return
+    try:
+        receipts.append_receipt_evidence(
+            db,
+            attempt_id=outcome.attempt_id,
+            kind=kind,
+            receipt=outcome.receipt.to_dict(),
+            verification=verification,
+        )
+    except IntegrityError:
+        db.rollback()
 
 
 def reconcile_pending(db) -> int:

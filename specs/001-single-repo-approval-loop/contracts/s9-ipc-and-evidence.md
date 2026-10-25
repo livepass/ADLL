@@ -1,6 +1,6 @@
 # S9 IPC 与安全证据接口契约草案
 
-**日期**：2026-10-24（R2 定向修订；R3 补 §2.1/§5.1/§6.1；R4 补 §5.1 全字段签名 + §6.2；R5 补 provider_request_id 签名覆盖）　**状态**：DRAFT（待审批；不改已批准 contracts/agent-adapter.md）
+**日期**：2026-10-24（R2 定向修订；R3 补 §2.1/§5.1/§6.1；R4 补 §5.1 全字段签名 + §6.2；R5 补 provider_request_id 签名覆盖；R6 补 §6.2.1 撤销竞态窗口）　**状态**：DRAFT（待审批；不改已批准 contracts/agent-adapter.md）
 **上位**：[s9-detailed-plan.md](./s9-detailed-plan.md)、[s9-isolation-architecture-decision.md](./s9-isolation-architecture-decision.md)
 
 本契约定义「FastAPI 宿主 ↔ 受保护启动器/Worker VM ↔ 固定出口」之间的最小接口与
@@ -219,6 +219,24 @@ SendReceipt {
   之后、`issued_at` 之前被撤销，宿主必须在核验时拒绝（收据虽签名有效，但其签发生效
   边界落在撤销之后）。该判定由宿主依据「撤销时间 vs 收据签发时间」的时序完成，不
   依赖 Egress 自证。
+
+#### 6.2.1 撤销竞态窗口（必须显式声明，不得静默接受）
+
+Egress 不读取审批数据库，因此**撤销无法在收据有效期内实时阻断已签发的发送**。该窗口
+必须显式声明，而不是假定「撤销即时生效」：
+
+- **窗口上界** = 收据 `expires_at`（即签发时配置的 `receipt_ttl_seconds`）。窗口内发生的
+  撤销**不阻断**该次发送，这是已知且可接受的残余风险；窗口外的撤销必须在签发时被
+  `build_request_from_db` 的活跃性校验拦住。
+- **事后判定归属宿主**：宿主 `settle` 时按「撤销时间 vs 收据 `issued_at`」二分：
+  - `revoked_at <= issued_at` → `revoked_before_issue`：收据不得升格 `confirmed_sent`，
+    只落 `possibly_sent` 并追加 `revocation_race` 证据；
+  - `revoked_at > issued_at` → `revoked_after_issue`：收据有效（`confirmed_sent`），
+    但必须追加 `revocation_after_issue` 证据以便审计追溯；
+  - 无撤销记录 → 不产生竞态证据。
+- **短 TTL 是缩小窗口的唯一手段**：缩短 `receipt_ttl_seconds` 可减小残余窗口，代价是
+  增加重签次数。生产取值须与撤销传播延迟一并确定，不得只按「够用」取值。
+- **禁止**：Egress 自行声称「授权仍有效」；撤销状态的权威来源只有宿主审批记录。
 
 ## 7. 固定请求体 vs 实际发送字节 SHA-256 对账
 

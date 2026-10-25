@@ -60,6 +60,17 @@ HOST_RECEIPT_SIGNED_FIELDS = (
     "expires_at",
 )
 
+# Launcher → Egress 调用者认证签名覆盖字段（S9-3A 问题 B）。
+# 目的：Egress 不得只凭 receiver/digest/policy 放行，必须认证调用者身份。
+LAUNCHER_AUTH_SIGNED_FIELDS = (
+    "key_id",
+    "attempt_id",
+    "request_digest",
+    "nonce",
+    "issued_at",
+    "expires_at",
+)
+
 
 def _canonical(obj: dict[str, Any]) -> bytes:
     """与 core.payload.canonical_payload_bytes 同源的规范化字节串。"""
@@ -454,6 +465,100 @@ def verify_host_receipt_against_request(
         return ReceiptVerification(False, "expired")
     if allowed_policy_versions is not None and receipt.policy_version not in allowed_policy_versions:
         return ReceiptVerification(False, "policy_version_not_accepted")
+    return ReceiptVerification(True, "ok")
+
+
+@dataclass(frozen=True)
+class LauncherAuth:
+    """Launcher → Egress 的调用者认证凭证（问题 B）。
+
+    覆盖 attempt/摘要/nonce 与有效期，使 Egress 能确认「这条发送请求来自被授权的
+    Launcher」而不只是「参数看起来对」。密钥由部署注入，不硬编码。
+    """
+
+    key_id: str
+    attempt_id: str
+    request_digest: str
+    nonce: str
+    issued_at: str
+    expires_at: str
+    signature: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key_id": self.key_id,
+            "attempt_id": self.attempt_id,
+            "request_digest": self.request_digest,
+            "nonce": self.nonce,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "signature": self.signature,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LauncherAuth:
+        required = ("key_id", "attempt_id", "request_digest", "nonce",
+                    "issued_at", "expires_at", "signature")
+        missing = [k for k in required if k not in data]
+        if missing:
+            raise ValueError(f"launcher_auth_missing_fields:{','.join(missing)}")
+        return cls(**{k: data[k] for k in required})
+
+
+def issue_launcher_auth(
+    *,
+    attempt_id: str,
+    request_digest: str,
+    nonce: str,
+    key_id: str,
+    key: bytes,
+    ttl_seconds: int = 120,
+) -> LauncherAuth:
+    issued = _now_iso()
+    expires = _expires_after(issued, ttl_seconds)
+    values = {
+        "key_id": key_id,
+        "attempt_id": attempt_id,
+        "request_digest": request_digest,
+        "nonce": nonce,
+        "issued_at": issued,
+        "expires_at": expires,
+    }
+    return LauncherAuth(
+        key_id=key_id,
+        attempt_id=attempt_id,
+        request_digest=request_digest,
+        nonce=nonce,
+        issued_at=issued,
+        expires_at=expires,
+        signature=sign(LAUNCHER_AUTH_SIGNED_FIELDS, values, key),
+    )
+
+
+def verify_launcher_auth(
+    auth: LauncherAuth,
+    *,
+    key: bytes,
+    attempt_id: str,
+    request_digest: str,
+    nonce: str,
+    now: datetime | None = None,
+) -> ReceiptVerification:
+    """Egress 侧验证调用者凭证：签名 + 绑定 + 有效期。"""
+    now = now or utcnow()
+    if not verify(LAUNCHER_AUTH_SIGNED_FIELDS, auth.to_dict(), key, auth.signature):
+        return ReceiptVerification(False, "signature_invalid")
+    if auth.attempt_id != attempt_id:
+        return ReceiptVerification(False, "attempt_mismatch")
+    if auth.request_digest != request_digest:
+        return ReceiptVerification(False, "request_digest_mismatch")
+    if auth.nonce != nonce:
+        return ReceiptVerification(False, "nonce_mismatch")
+    issued = _parse_iso(auth.issued_at)
+    if issued is None or _as_naive(issued) > _as_naive(now):
+        return ReceiptVerification(False, "issued_at_invalid")
+    if _expired(auth.expires_at, now):
+        return ReceiptVerification(False, "expired")
     return ReceiptVerification(True, "ok")
 
 
